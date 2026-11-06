@@ -17,8 +17,9 @@
 # Run it from other repositories in one of two ways:
 #   1. Reusable workflow (any GitHub plan): add the small caller workflow from
 #      README.md to the target repository.
-#   2. Ruleset workflow (GitHub Enterprise): an organization or enterprise
-#      ruleset requires this file to pass, with no file in the target repo.
+#   2. Ruleset workflow (GitHub Enterprise): an enterprise ruleset (or an
+#      organization ruleset in this file's own organization) requires this file
+#      to pass, with no file in the target repo.
 #
 # The job checks out the pull request, runs scanner/scan_agent_codebase.py
 # (AST checks plus Opengrep with the adk-core, mcp and gcp-gemini rules), then:

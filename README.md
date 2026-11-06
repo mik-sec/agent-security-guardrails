@@ -26,13 +26,12 @@ scanner/scan_agent_codebase.py              Scanner (AST + Opengrep), Python 3.1
 rules/adk-core.yaml                         ADK rules (39) and the control catalog
 rules/mcp.yaml                              MCP client/server rules (15)
 rules/gcp-gemini.yaml                       Google Cloud and Gemini SDK rules (15)
-examples/caller-workflow.yml                Caller workflow for target repositories
 ```
 
 ## Add the scan to a repository
 
-Copy [`examples/caller-workflow.yml`](examples/caller-workflow.yml) to
-`.github/workflows/agent-security.yml` in the repository you want to scan:
+Add this file as `.github/workflows/agent-security.yml` in each repository you
+want to scan:
 
 ```yaml
 name: Agent Security
@@ -82,11 +81,13 @@ Inputs:
 To switch back to advisory mode, set `enforce: false`. The comments and
 annotations keep working; only the failing check goes away.
 
-On GitHub Enterprise, an organization or enterprise ruleset can instead require
-`.github/workflows/agent-security-scan.yml` from this repository directly
-(**Require workflows to pass before merging**), so target repositories need no
-workflow file. In that mode, set the Actions variable `AGENT_SECURITY_ENFORCE`
-to `true` in the target organization to block merges.
+On GitHub Enterprise, organization and enterprise rulesets can also require a
+workflow directly (**Require workflows to pass before merging**), so target
+repositories need no caller file. For an organization ruleset, the workflow must
+live in a repository in that organization; to cover several organizations, use
+an enterprise ruleset. This workflow runs unchanged in that mode. Set the
+Actions variable `AGENT_SECURITY_ENFORCE` to `true` in the target organization
+to block merges.
 
 ## Email on failure
 
