@@ -1,0 +1,775 @@
+# Copyright 2026 The Agent Security Guardrails Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# ==============================================================================
+# Agent Security Guardrails — OPTIONAL rule pack: Google Cloud + Gemini SDK
+# rule_pack: gcp-gemini
+#
+# Direct google-genai / vertexai Gemini SDK calls, Model Armor clients, Google
+# Cloud credentials, Cloud Storage, MCP Toolbox tools.yaml, deploy configs and
+# Terraform. ADK framework APIs are covered by rules/adk-core.yaml.
+#
+# Compatible with Opengrep and Semgrep OSS:
+#   opengrep scan --config rules/gcp-gemini.yaml <path>
+# ==============================================================================
+
+rules:
+  # ----------------------------------------------------------------------------
+  # L1-02: Gemini safety thresholds disabled (BLOCK_NONE / OFF)
+  # ----------------------------------------------------------------------------
+  - id: gcp-gemini-safety-filter-disabled
+    message: >-
+      [L1-02 | Layer 1 | gcp-gemini] Gemini safety threshold is set to
+      `$THRESHOLD` (BLOCK_NONE / OFF) in a SafetySetting or safety_settings
+      entry, so the model neither blocks nor flags harmful or injected content
+      for that harm category. Use HarmBlockThreshold.BLOCK_LOW_AND_ABOVE (or
+      BLOCK_MEDIUM_AND_ABOVE) for every HarmCategory.
+    severity: ERROR
+    languages: [python]
+    metadata:
+      control_id: "L1-02"
+      rule_pack: "gcp-gemini"
+      layer: "Layer 1: Prompt, Model & State Integrity"
+      category: security
+      cwe: "CWE-693: Protection Mechanism Failure"
+      owasp_asi: "ASI01"
+      owasp_llm: "LLM01:2025 Prompt Injection"
+      severity_tier: "HIGH"
+      title: "Gemini Safety Filters Disabled"
+      recommended_fix: "Pass types.GenerateContentConfig(safety_settings=[types.SafetySetting(category=<each types.HarmCategory>, threshold=types.HarmBlockThreshold.BLOCK_LOW_AND_ABOVE)]) to the call (or to LlmAgent(generate_content_config=...)) and never use BLOCK_NONE or OFF."
+    patterns:
+      - pattern-either:
+          # google-genai types.SafetySetting / vertexai SafetySetting
+          - pattern: SafetySetting(..., threshold=$THRESHOLD, ...)
+          - pattern: $MODULE.SafetySetting(..., threshold=$THRESHOLD, ...)
+          # dict form: {"category": ..., "threshold": ...} (config dicts passed to generate_content)
+          - patterns:
+              - pattern-inside: |
+                  {..., "category": $CATEGORY, ...}
+              - pattern: |
+                  {..., "threshold": $THRESHOLD, ...}
+          # mapping form: {HarmCategory.X: HarmBlockThreshold.BLOCK_NONE} (google-generativeai / vertexai)
+          - patterns:
+              - pattern: |
+                  {..., $CATEGORY: $THRESHOLD, ...}
+              - metavariable-regex:
+                  metavariable: $CATEGORY
+                  regex: '(?i)^(?:[\w.]+\.)?["'']?(?:HARM_CATEGORY_\w+|HARASSMENT|HATE(?:_SPEECH)?|SEXUAL(?:LY_EXPLICIT)?|DANGEROUS(?:_CONTENT)?|CIVIC_INTEGRITY)["'']?$'
+          # single threshold applied to every category
+          - pattern: $CALL(..., safety_settings=$THRESHOLD, ...)
+      - metavariable-regex:
+          metavariable: $THRESHOLD
+          regex: '^(?:(?:[A-Za-z_]\w*\.)*(?:BLOCK_NONE|OFF)|["''](?i:block_none|off)["''])$'
+      - focus-metavariable: $THRESHOLD
+
+  # ----------------------------------------------------------------------------
+  # L1-02: Direct Gemini SDK call pinned to a mutable model alias
+  # ----------------------------------------------------------------------------
+  - id: gcp-gemini-unpinned-model-alias
+    message: >-
+      [L1-02 | Layer 1 | gcp-gemini] Direct Gemini SDK call or GenerativeModel
+      uses the mutable model alias "$MODEL" ('latest' / '-exp'), so the model
+      and its safety behaviour can change underneath the agent without review
+      or re-evaluation. Pin an explicit, stable model version and change it only
+      through a reviewed, evaluated config update.
+    severity: WARNING
+    languages: [python]
+    metadata:
+      control_id: "L1-02"
+      rule_pack: "gcp-gemini"
+      layer: "Layer 1: Prompt, Model & State Integrity"
+      category: security
+      cwe: "CWE-1357: Reliance on Insufficiently Trustworthy Component"
+      owasp_asi: "ASI04"
+      owasp_llm: "LLM03:2025 Supply Chain"
+      severity_tier: "MEDIUM"
+      title: "Unpinned Gemini Model Alias in Direct SDK Call"
+      recommended_fix: "Replace the alias with a pinned, versioned Gemini model ID held in a reviewed config constant (no 'latest' or '-exp' suffix) in client.models.generate_content(model=...) / GenerativeModel(...), and re-run your evals before bumping it."
+    patterns:
+      - pattern-either:
+          - pattern: $CLIENT.generate_content(..., model="$MODEL", ...)
+          - pattern: $CLIENT.generate_content_stream(..., model="$MODEL", ...)
+          - pattern: $CLIENT.generate_videos(..., model="$MODEL", ...)
+          - pattern: $CLIENT.chats.create(..., model="$MODEL", ...)
+          - pattern: GenerativeModel("$MODEL", ...)
+          - pattern: GenerativeModel(..., model_name="$MODEL", ...)
+          - pattern: $MODULE.GenerativeModel("$MODEL", ...)
+          - pattern: $MODULE.GenerativeModel(..., model_name="$MODEL", ...)
+      # Mirrors the AST scanner: 'latest' anywhere (case-insensitive) or a '-exp' suffix.
+      - metavariable-regex:
+          metavariable: $MODEL
+          regex: '^(?:(?i:.*latest.*)|.*-exp)$'
+
+  # ----------------------------------------------------------------------------
+  # L1-01: Direct Gemini SDK call with an interpolated prompt
+  # ----------------------------------------------------------------------------
+  - id: gcp-gemini-prompt-string-interpolation
+    message: >-
+      [L1-01 | Layer 1 | gcp-gemini] Direct Gemini SDK call `$METHOD` builds its
+      `contents` / `prompt` with an f-string, str.format(), '%' or '+'
+      concatenation, mixing instructions and possibly untrusted data in one
+      undelimited string, which enables prompt injection. Keep instructions in
+      system_instruction and pass untrusted text as a separate, delimited Part.
+    mode: taint
+    severity: WARNING
+    languages: [python]
+    metadata:
+      control_id: "L1-01"
+      rule_pack: "gcp-gemini"
+      layer: "Layer 1: Prompt, Model & State Integrity"
+      category: security
+      cwe: "CWE-74: Improper Neutralization of Special Elements in Output Used by a Downstream Component"
+      owasp_asi: "ASI01"
+      owasp_llm: "LLM01:2025 Prompt Injection"
+      severity_tier: "HIGH"
+      title: "Interpolated Prompt in Direct Gemini SDK Call"
+      recommended_fix: "Put trusted instructions in types.GenerateContentConfig(system_instruction=...) and pass untrusted input as its own part, e.g. contents=[types.Part.from_text(text=user_text)]; if you must wrap it in tags, escape it first with html.escape(), and screen it with Model Armor."
+    pattern-sources:
+      - patterns:
+          - pattern-either:
+              - pattern: f"...{$VALUE}..."
+              - pattern: $TEMPLATE.format(...)
+              - pattern: |
+                  "..." % $ARGS
+              - pattern: |
+                  "..." + $RIGHT
+              - pattern: |
+                  $LEFT + "..."
+          - pattern-not: |
+              "..." + "..."
+    pattern-sinks:
+      - patterns:
+          - pattern-either:
+              - pattern: $CLIENT.$METHOD($PROMPT, ...)
+              - pattern: $CLIENT.$METHOD(..., contents=$PROMPT, ...)
+              - pattern: $CLIENT.$METHOD(..., prompt=$PROMPT, ...)
+          - metavariable-regex:
+              metavariable: $METHOD
+              regex: '^(?:generate_content|generate_content_stream|generate_content_async|generate_videos)$'
+          - focus-metavariable: $PROMPT
+
+  # ----------------------------------------------------------------------------
+  # L1-03: Direct Gemini SDK model call bypasses ADK plugins and callbacks
+  # ----------------------------------------------------------------------------
+  - id: gcp-gemini-direct-sdk-call
+    message: >-
+      [L1-03 | Layer 1 | gcp-gemini] Direct Gemini SDK model call
+      `$CLIENT.$METHOD(...)` runs outside the ADK Runner, so ADK plugins and
+      callbacks (ModelArmorPlugin, before_model_callback, after_model_callback)
+      never screen its prompt or response—even in files that register
+      ModelArmorPlugin on an App or Runner. Route the call through an ADK
+      LlmAgent / AgentTool, or wrap custom transport logic in a BaseLlm
+      subclass.
+    severity: WARNING
+    languages: [python]
+    metadata:
+      control_id: "L1-03"
+      rule_pack: "gcp-gemini"
+      layer: "Layer 1: Prompt, Model & State Integrity"
+      category: security
+      cwe: "CWE-693: Protection Mechanism Failure"
+      owasp_asi: "ASI01"
+      owasp_llm: "LLM01:2025 Prompt Injection"
+      severity_tier: "MEDIUM"
+      title: "Direct Gemini SDK Call Bypasses ADK Guardrails"
+      recommended_fix: "Route the model call through an ADK LlmAgent / AgentTool on an App or Runner configured with plugins=[google.adk.integrations.model_armor.ModelArmorPlugin(...)], or implement a BaseLlm subclass so before_model_callback and after_model_callback always run."
+    patterns:
+      - pattern: $CLIENT.$METHOD(...)
+      - metavariable-regex:
+          metavariable: $METHOD
+          regex: '^(?:generate_content|generate_content_stream|generate_content_async|generate_videos)$'
+      # Custom ADK model connectors (BaseLlm / Gemini subclasses) are invoked by the
+      # Runner, so their SDK calls already sit inside the plugin/callback lifecycle.
+      - pattern-not-inside: |
+          class $LLM(..., BaseLlm, ...):
+            ...
+      - pattern-not-inside: |
+          class $LLM(..., $ADK_MODELS.BaseLlm, ...):
+            ...
+      - pattern-not-inside: |
+          class $LLM(..., Gemini, ...):
+            ...
+      - pattern-not-inside: |
+          class $LLM(..., $ADK_MODELS.Gemini, ...):
+            ...
+      # Avoid double-reporting when the enclosing function manually screens both the
+      # prompt and the response with Model Armor (already flagged by
+      # gcp-model-armor-hand-rolled-client).
+      - pattern-not-inside: |
+          def $FUNC(...):
+            ...
+            <... $ARMOR.sanitize_user_prompt(...) ...>
+            ...
+            $CLIENT.$METHOD(...)
+            ...
+            <... $ARMOR2.sanitize_model_response(...) ...>
+            ...
+
+  # ----------------------------------------------------------------------------
+  # L1-03: Hand-rolled Model Armor client instead of ADK ModelArmorPlugin
+  # ----------------------------------------------------------------------------
+  - id: gcp-model-armor-hand-rolled-client
+    message: >-
+      [L1-03 | Layer 1 | gcp-gemini] Hand-rolled Model Armor screening
+      (ModelArmorClient / sanitize_user_prompt / sanitize_model_response).
+      Custom wiring often screens only the latest user text, skips system
+      instructions, earlier turns and tool outputs, or fails open on errors.
+      Prefer ADK's ModelArmorPlugin on the App or Runner.
+    severity: WARNING
+    languages: [python]
+    metadata:
+      control_id: "L1-03"
+      rule_pack: "gcp-gemini"
+      layer: "Layer 1: Prompt, Model & State Integrity"
+      category: security
+      cwe: "CWE-693: Protection Mechanism Failure"
+      owasp_asi: "ASI01"
+      owasp_llm: "LLM01:2025 Prompt Injection"
+      severity_tier: "MEDIUM"
+      title: "Hand-Rolled Model Armor Client"
+      recommended_fix: "Register google.adk.integrations.model_armor.ModelArmorPlugin(...) in App(plugins=[...]) or Runner(plugins=[...]); keep a direct modelarmor_v1 client only for content the plugin does not screen (for example file bytes via ByteDataItem), screening every part and failing closed."
+    patterns:
+      - pattern-either:
+          - pattern: ModelArmorClient(...)
+          - pattern: ModelArmorAsyncClient(...)
+          - pattern: $MODULE.ModelArmorClient(...)
+          - pattern: $MODULE.ModelArmorAsyncClient(...)
+          - pattern: $CLIENT.sanitize_user_prompt(...)
+          - pattern: $CLIENT.sanitize_model_response(...)
+      # Skips a vendored ModelArmorPlugin implementation and helpers that screen binary
+      # payloads (ByteDataItem), which ModelArmorPlugin does not inspect.
+      - pattern-not-inside: |
+          class ModelArmorPlugin(...):
+            ...
+      - pattern-not-inside: |
+          def $SCREEN(...):
+            ...
+            <... ByteDataItem(...) ...>
+            ...
+      - pattern-not-inside: |
+          def $SCREEN(...):
+            ...
+            <... $MA.ByteDataItem(...) ...>
+            ...
+
+  # ----------------------------------------------------------------------------
+  # L2-01: Runtime-bound (certificate-bound) agent tokens disabled
+  # ----------------------------------------------------------------------------
+  - id: gcp-runtime-bound-token-disabled
+    message: >-
+      [L2-01 | Layer 2 | gcp-gemini] `$ENV_VAR` is set to "$VALUE", which turns
+      off runtime-bound agent tokens / token-sharing prevention and lets a
+      stolen access token be replayed outside the agent runtime. Remove the
+      override (the default is enabled) or set it to "true".
+    severity: ERROR
+    languages: [python]
+    metadata:
+      control_id: "L2-01"
+      rule_pack: "gcp-gemini"
+      layer: "Layer 2: Identity, Auth & Least-Privilege IAM"
+      category: security
+      cwe: "CWE-294: Authentication Bypass by Capture-replay"
+      owasp_asi: "ASI03"
+      severity_tier: "CRITICAL"
+      title: "Runtime-Bound Agent Tokens Disabled"
+      recommended_fix: "Delete the assignment (or set GOOGLE_API_ENABLE_RUNTIME_BOUND_TOKEN / GOOGLE_API_PREVENT_AGENT_TOKEN_SHARING_FOR_GCP_SERVICES to \"true\") in code, os.environ and deployment env_vars so Agent Identity tokens stay bound to the runtime."
+    patterns:
+      - pattern-either:
+          - pattern: os.environ["$ENV_VAR"] = "$VALUE"
+          - pattern: os.environ.setdefault("$ENV_VAR", "$VALUE")
+          - pattern: os.putenv("$ENV_VAR", "$VALUE")
+          - pattern: |
+              os.environ.update({..., "$ENV_VAR": "$VALUE", ...})
+          - pattern: |
+              $CALL(..., env_vars={..., "$ENV_VAR": "$VALUE", ...}, ...)
+          - pattern: |
+              env_vars = {..., "$ENV_VAR": "$VALUE", ...}
+          - pattern: env_vars["$ENV_VAR"] = "$VALUE"
+      - metavariable-regex:
+          metavariable: $ENV_VAR
+          regex: '^(?:GOOGLE_API_ENABLE_RUNTIME_BOUND_TOKEN|GOOGLE_API_PREVENT_AGENT_TOKEN_SHARING_FOR_GCP_SERVICES)$'
+      - metavariable-regex:
+          metavariable: $VALUE
+          regex: '^(?i:false|0|no|off)$'
+
+  # ----------------------------------------------------------------------------
+  # L3-03: MCP Toolbox tools.yaml identity parameter without authServices
+  # ----------------------------------------------------------------------------
+  - id: gcp-mcp-toolbox-identity-param-without-auth
+    message: >-
+      [L3-03 | Layer 3 | gcp-gemini] MCP Toolbox tool parameter `$NAME` looks
+      like a caller identity but has no `authServices` binding, so the model
+      (and any prompt injection) chooses whose data the SQL statement reads or
+      writes (BOLA / IDOR). Bind it to the caller's verified token claim with
+      authServices.
+    severity: ERROR
+    languages: [yaml]
+    paths:
+      include:
+        - "tools.yaml"
+        - "tools.yml"
+        - "*tools*.yaml"
+        - "*tools*.yml"
+    metadata:
+      control_id: "L3-03"
+      rule_pack: "gcp-gemini"
+      layer: "Layer 3: Tool, Data Connector & Network Safety"
+      category: security
+      cwe: "CWE-639: Authorization Bypass Through User-Controlled Key"
+      owasp_asi: "ASI03"
+      owasp_llm: "LLM06:2025 Excessive Agency"
+      severity_tier: "HIGH"
+      title: "MCP Toolbox Identity Parameter Without authServices"
+      recommended_fix: "Add authServices to the parameter (e.g. authServices: [{name: google-signin, field: sub}] or field: email) so MCP Toolbox fills it from the caller's verified OIDC token instead of from model output; tool-level authRequired alone does not bind the value."
+    patterns:
+      - pattern-either:
+          # classic layout: top-level `tools:` map
+          - pattern-inside: |
+              tools:
+                ...
+          # per-resource document layout: `kind: tool` (one YAML document per tool)
+          - patterns:
+              - pattern-inside: |
+                  kind: $TOOL_KIND
+                  ...
+              - metavariable-regex:
+                  metavariable: $TOOL_KIND
+                  regex: '^["'']?tools?["'']?$'
+      - pattern-inside: |
+          parameters: [...]
+      - pattern-inside: |
+          - name: $NAME
+            ...
+      - pattern-not-inside: |
+          - name: $NAME
+            ...
+            authServices: $AUTH
+            ...
+      # `authSources` is the older MCP Toolbox spelling of `authServices`.
+      - pattern-not-inside: |
+          - name: $NAME
+            ...
+            authSources: $AUTH
+            ...
+      - pattern: |
+          name: $NAME
+      - metavariable-regex:
+          metavariable: $NAME
+          regex: '^(?i:user_?id|tenant_?id|owner_?id|account_?id|customer_?id|email|user_?email)$'
+
+  # ----------------------------------------------------------------------------
+  # L4-04: Cloud Storage bucket / upload path taken from a function parameter
+  # ----------------------------------------------------------------------------
+  - id: gcp-gcs-resource-from-tool-parameter
+    message: >-
+      [L4-04 | Layer 4 | gcp-gemini] Cloud Storage bucket name or local upload
+      path comes from a function parameter. When the function is an agent tool,
+      the model (or a prompt injection) picks which bucket is read or written,
+      or which local file is uploaded (cross-tenant access, exfiltration).
+      Resolve buckets from a server-side allowlist and confine upload paths to a
+      fixed directory.
+    mode: taint
+    severity: WARNING
+    languages: [python]
+    paths:
+      exclude:
+        - "**/scripts/**"
+        - "scripts/**"
+        - "**/cicd/**"
+        - "cicd/**"
+        - "**/ingestion/**"
+        - "ingestion/**"
+        - "*deploy*.py"
+        - "*cli*.py"
+        - "**/cli/**"
+    metadata:
+      control_id: "L4-04"
+      rule_pack: "gcp-gemini"
+      layer: "Layer 4: Sub-Agent, Sandbox & Artifact Isolation"
+      category: security
+      cwe: "CWE-73: External Control of File Name or Path"
+      owasp_asi: "ASI02"
+      owasp_llm: "LLM06:2025 Excessive Agency"
+      severity_tier: "HIGH"
+      title: "Cloud Storage Resource Chosen by Tool Parameter"
+      recommended_fix: "Check the value against a server-side allowlist before use (if bucket_name not in ALLOWED_BUCKETS: raise ValueError(...)) or map an opaque key to a configured bucket, and confine upload paths with pathlib.Path(base_dir, name).resolve().is_relative_to(base_dir) (or os.path.basename)."
+    pattern-sources:
+      - patterns:
+          - pattern: |
+              def $FUNC(..., $PARAM, ...):
+                ...
+          - pattern-not-inside: |
+              class $CLASS:
+                ...
+          - pattern-not-inside: |
+              class $CLASS(...):
+                ...
+          - pattern-not-inside: |
+              @$ROUTER.get(...)
+              def $FUNC(...):
+                ...
+          - pattern-not-inside: |
+              @$ROUTER.post(...)
+              def $FUNC(...):
+                ...
+          - pattern-not-inside: |
+              @$ROUTER.put(...)
+              def $FUNC(...):
+                ...
+          - pattern-not-inside: |
+              @$ROUTER.delete(...)
+              def $FUNC(...):
+                ...
+          - pattern-not-inside: |
+              @$ROUTER.patch(...)
+              def $FUNC(...):
+                ...
+          - pattern-not-inside: |
+              def $FUNC(..., $NS: argparse.Namespace, ...):
+                ...
+          - pattern-not-inside: |
+              def $FUNC(..., $NS: Namespace, ...):
+                ...
+          # Receivers / framework context objects are not model-chosen values.
+          - metavariable-regex:
+              metavariable: $PARAM
+              regex: '^(?!(?:self|cls|tool_context|callback_context|ctx|context)$)\w+$'
+          - focus-metavariable: $PARAM
+    pattern-sanitizers:
+      - pattern: os.path.basename(...)
+      - pattern: pathlib.Path(...).name
+      - pattern: Path(...).name
+      - patterns:
+          - pattern-either:
+              - pattern: $MAPPING[$KEY]
+              - pattern: $MAPPING.get(...)
+          - metavariable-regex:
+              metavariable: $MAPPING
+              regex: '^[A-Z][A-Z0-9_]*$'
+    pattern-sinks:
+      - patterns:
+          - pattern-either:
+              - pattern: $CLIENT.bucket($SINK, ...)
+              - pattern: $CLIENT.get_bucket($SINK, ...)
+              - pattern: $CLIENT.lookup_bucket($SINK, ...)
+              - pattern: storage.Bucket($CLIENT, $SINK, ...)
+              - pattern: storage.Bucket($CLIENT, ..., name=$SINK, ...)
+              - pattern: $BLOB.upload_from_filename($SINK, ...)
+              - pattern: $BLOB.upload_from_filename(..., filename=$SINK, ...)
+          - focus-metavariable: $SINK
+          # Allowlist checks (mirrors the scanner's ALLOWED_BUCKETS guard).
+          - pattern-not-inside: |
+              if <... $X not in $ALLOWED ...>:
+                ...
+              ...
+          - pattern-not-inside: |
+              if <... $X in $ALLOWED ...>:
+                ...
+
+  # ----------------------------------------------------------------------------
+  # L5-04: Static service account key loading
+  # ----------------------------------------------------------------------------
+  - id: gcp-static-service-account-key
+    message: >-
+      [L5-04 | Layer 5 | gcp-gemini] Long-lived service account key loaded via
+      `$LOADER`. Static JSON keys can be copied and replayed from anywhere,
+      bypass Workload Identity / Agent Identity and violate
+      iam.disableServiceAccountKeyCreation. Use keyless Application Default
+      Credentials (only an external_account Workload Identity Federation config
+      file is acceptable here).
+    severity: ERROR
+    languages: [python]
+    metadata:
+      control_id: "L5-04"
+      rule_pack: "gcp-gemini"
+      layer: "Layer 5: Resilience, Telemetry & Secure Delivery Gates"
+      category: security
+      cwe: "CWE-522: Insufficiently Protected Credentials"
+      owasp_asi: "ASI03"
+      severity_tier: "CRITICAL"
+      title: "Static Service Account Key Loading"
+      recommended_fix: "Use google.auth.default() with the runtime's attached service account, GKE Workload Identity or Agent Identity (or google.auth.impersonated_credentials.Credentials for cross-project access), then delete the key and enforce the iam.disableServiceAccountKeyCreation org policy."
+    patterns:
+      - pattern-either:
+          # google.oauth2.service_account.Credentials, google-cloud *Client classes, oauth2client
+          - pattern: $CREDS.$LOADER(...)
+          - pattern: $LOADER(...)
+      - metavariable-regex:
+          metavariable: $LOADER
+          regex: '^(?:from_service_account_file|from_service_account_info|from_service_account_json|from_json_keyfile_name|from_json_keyfile_dict|load_credentials_from_file|load_credentials_from_dict)$'
+
+  # ----------------------------------------------------------------------------
+  # L5-04: GOOGLE_APPLICATION_CREDENTIALS set from Python code
+  # ----------------------------------------------------------------------------
+  - id: gcp-google-application-credentials-in-code
+    message: >-
+      [L5-04 | Layer 5 | gcp-gemini] Code points GOOGLE_APPLICATION_CREDENTIALS at
+      a credentials file, so Application Default Credentials load a long-lived
+      service account key instead of the runtime's keyless identity (only an
+      external_account Workload Identity Federation config is acceptable).
+      Remove the assignment and let ADC use the attached service account,
+      Workload Identity or Agent Identity.
+    severity: ERROR
+    languages: [python]
+    metadata:
+      control_id: "L5-04"
+      rule_pack: "gcp-gemini"
+      layer: "Layer 5: Resilience, Telemetry & Secure Delivery Gates"
+      category: security
+      cwe: "CWE-522: Insufficiently Protected Credentials"
+      owasp_asi: "ASI03"
+      severity_tier: "HIGH"
+      title: "GOOGLE_APPLICATION_CREDENTIALS Set in Code"
+      recommended_fix: "Delete the os.environ / os.putenv assignment and rely on google.auth.default() resolving the runtime's attached service account, GKE Workload Identity or Agent Identity; never point GOOGLE_APPLICATION_CREDENTIALS at a JSON key."
+    patterns:
+      - pattern-either:
+          - pattern: os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = $VALUE
+          - pattern: os.environ.setdefault("GOOGLE_APPLICATION_CREDENTIALS", $VALUE)
+          - pattern: os.putenv("GOOGLE_APPLICATION_CREDENTIALS", $VALUE)
+          - pattern: |
+              os.environ.update({..., "GOOGLE_APPLICATION_CREDENTIALS": $VALUE, ...})
+      # Assigning an empty string clears the variable, which is the safe direction.
+      - metavariable-regex:
+          metavariable: $VALUE
+          regex: '^(?!(?:""|'''')$)'
+
+  # ----------------------------------------------------------------------------
+  # L5-04: Secret-named variables passed in plaintext deploy env_vars (Python)
+  # ----------------------------------------------------------------------------
+  - id: gcp-secret-in-deploy-env-vars
+    message: >-
+      [L5-04 | Layer 5 | gcp-gemini] Secret-named environment variable is passed
+      as a plaintext value in deployment `env_vars`, so the secret is stored in
+      the deployed resource's configuration and readable by anyone who can view
+      it. Reference Secret Manager instead.
+    mode: taint
+    severity: ERROR
+    languages: [python]
+    metadata:
+      control_id: "L5-04"
+      rule_pack: "gcp-gemini"
+      layer: "Layer 5: Resilience, Telemetry & Secure Delivery Gates"
+      category: security
+      cwe: "CWE-526: Cleartext Storage of Sensitive Information in an Environment Variable"
+      owasp_asi: "ASI03"
+      severity_tier: "HIGH"
+      title: "Plaintext Secret in Deployment env_vars"
+      recommended_fix: "Store the value in Secret Manager and pass a reference, e.g. agent_engines.create(..., env_vars={\"API_KEY\": {\"secret\": \"api-key\", \"version\": \"latest\"}}) or aiplatform_v1 types.SecretRef(secret=..., version=...), granting the runtime service account roles/secretmanager.secretAccessor; prefer keyless Vertex AI auth over GOOGLE_API_KEY."
+    pattern-sources:
+      - patterns:
+          - pattern-either:
+              - pattern: |
+                  {..., "$KEY": $VALUE, ...}
+              - pattern: $DICT["$KEY"] = $VALUE
+          # Mirrors the AST scanner's secret-env-key regex (minus the two boolean
+          # token-binding flags); `_TOKEN` must end the name so MAX_OUTPUT_TOKENS or
+          # TOKEN_LIMIT style settings are not reported.
+          - metavariable-regex:
+              metavariable: $KEY
+              regex: '(?i)^(?!(?:GOOGLE_API_ENABLE_RUNTIME_BOUND_TOKEN|GOOGLE_API_PREVENT_AGENT_TOKEN_SHARING_FOR_GCP_SERVICES)$).*(?:API_KEY|CLIENT_SECRET|_SECRET|_PASSWORD|_TOKEN(?![A-Za-z0-9_])|PRIVATE_KEY|GOOGLE_APPLICATION_CREDENTIALS)'
+          # Secret Manager references are the recommended fix, not a finding.
+          - metavariable-regex:
+              metavariable: $VALUE
+              regex: '(?s)^(?!(?:[\w.]+\.)?SecretRef\s*\(|\{.*["'']secret["'']\s*:)'
+    pattern-sinks:
+      - patterns:
+          - pattern-either:
+              - pattern: |
+                  $CALL(..., env_vars={..., "$KEY": $VALUE, ...}, ...)
+              - pattern: |
+                  {..., "env_vars": {..., "$KEY": $VALUE, ...}, ...}
+              - pattern: |
+                  env_vars = {..., "$KEY": $VALUE, ...}
+              - pattern: env_vars["$KEY"] = $VALUE
+          - metavariable-regex:
+              metavariable: $KEY
+              regex: '(?i)^(?!(?:GOOGLE_API_ENABLE_RUNTIME_BOUND_TOKEN|GOOGLE_API_PREVENT_AGENT_TOKEN_SHARING_FOR_GCP_SERVICES)$).*(?:API_KEY|CLIENT_SECRET|_SECRET|_PASSWORD|_TOKEN(?![A-Za-z0-9_])|PRIVATE_KEY|GOOGLE_APPLICATION_CREDENTIALS)'
+          - metavariable-regex:
+              metavariable: $VALUE
+              regex: '(?s)^(?!(?:[\w.]+\.)?SecretRef\s*\(|\{.*["'']secret["'']\s*:)'
+          - focus-metavariable: $VALUE
+      - patterns:
+          - pattern-either:
+              - pattern: $CALL(..., env_vars=$ENV_SINK, ...)
+              - pattern: |
+                  {..., "env_vars": $ENV_SINK, ...}
+          - metavariable-regex:
+              metavariable: $ENV_SINK
+              regex: '^\s*[^\{]'
+          - focus-metavariable: $ENV_SINK
+
+  # ----------------------------------------------------------------------------
+  # L5-04: GOOGLE_APPLICATION_CREDENTIALS pointed at a JSON key in config files
+  # ----------------------------------------------------------------------------
+  - id: gcp-google-application-credentials-in-config
+    message: >-
+      [L5-04 | Layer 5 | gcp-gemini] Configuration sets
+      GOOGLE_APPLICATION_CREDENTIALS to a `.json` key file, shipping or mounting
+      a long-lived service account key instead of using the runtime's keyless
+      identity. Remove it and rely on Application Default Credentials (an
+      external_account Workload Identity Federation config is the only
+      acceptable JSON here).
+    severity: ERROR
+    languages: [regex]
+    paths:
+      include:
+        - ".env"
+        - ".env.*"
+        - "*.env"
+        - "*.sh"
+        - "*.bash"
+        - "Dockerfile"
+        - "Dockerfile.*"
+        - "*.dockerfile"
+        - "*.yaml"
+        - "*.yml"
+        - "*.json"
+        # Opengrep's `*` does not match a leading dot (e.g. .agent_engine_config.json).
+        - ".*.yaml"
+        - ".*.yml"
+        - ".*.json"
+        - "*.toml"
+        - "*.ini"
+        - "*.cfg"
+        - "*.conf"
+        - "*.properties"
+        - "*.tf"
+        - "*.tfvars"
+    metadata:
+      control_id: "L5-04"
+      rule_pack: "gcp-gemini"
+      layer: "Layer 5: Resilience, Telemetry & Secure Delivery Gates"
+      category: security
+      cwe: "CWE-522: Insufficiently Protected Credentials"
+      owasp_asi: "ASI03"
+      severity_tier: "HIGH"
+      title: "GOOGLE_APPLICATION_CREDENTIALS Points at a Key File in Config"
+      recommended_fix: "Remove GOOGLE_APPLICATION_CREDENTIALS and the mounted key from .env, Dockerfile, Kubernetes or deploy YAML; attach a service account (Cloud Run / Agent Engine), use GKE Workload Identity or Agent Identity, and delete the key."
+    # (1) KEY=path / KEY: path / ENV KEY path / `- KEY=path` at line start (dotenv,
+    #     shell, Dockerfile, YAML, JSON); (2) name/value env entries (Kubernetes,
+    #     JSON, Terraform). Python code is excluded by `paths` (see the -in-code rule).
+    pattern-regex: '(?m)(?:^[ \t]*(?:-[ \t]*)?(?:export[ \t]+|ENV[ \t]+)?["'']?GOOGLE_APPLICATION_CREDENTIALS["'']?(?:[ \t]*[:=][ \t]*|[ \t]+)["'']?[^\s"''#,}]*\.json\b|["'']?name["'']?[ \t]*[:=][ \t]*["'']?GOOGLE_APPLICATION_CREDENTIALS["'']?[ \t]*,?\s*["'']?value["'']?[ \t]*[:=][ \t]*["'']?[^\s"''#,}]*\.json\b)'
+
+  # ----------------------------------------------------------------------------
+  # L5-04: Plaintext API keys / secrets in YAML deploy configs
+  # ----------------------------------------------------------------------------
+  - id: gcp-secret-in-deploy-config-yaml
+    message: >-
+      [L5-04 | Layer 5 | gcp-gemini] YAML deploy config embeds a literal value
+      for secret-named key `$KEY` (in `env_vars`, or GOOGLE_API_KEY anywhere),
+      so the credential is committed to source and copied into the deployed
+      environment in plaintext. Reference Secret Manager and prefer keyless
+      Vertex AI authentication over GOOGLE_API_KEY.
+    severity: ERROR
+    languages: [yaml]
+    metadata:
+      control_id: "L5-04"
+      rule_pack: "gcp-gemini"
+      layer: "Layer 5: Resilience, Telemetry & Secure Delivery Gates"
+      category: security
+      cwe: "CWE-798: Use of Hard-coded Credentials"
+      owasp_asi: "ASI03"
+      severity_tier: "HIGH"
+      title: "Plaintext Secret in YAML Deploy Config"
+      recommended_fix: "Replace the literal with a Secret Manager reference (env_vars entry {secret: <name>, version: latest}, Cloud Run secretKeyRef / --set-secrets), grant roles/secretmanager.secretAccessor to the runtime service account, and use Vertex AI with Application Default Credentials (GOOGLE_GENAI_USE_VERTEXAI=TRUE) instead of GOOGLE_API_KEY."
+    patterns:
+      - pattern-either:
+          - patterns:
+              - pattern-inside: |
+                  env_vars:
+                    ...
+              - pattern: |
+                  $KEY: $VALUE
+              - metavariable-regex:
+                  metavariable: $KEY
+                  regex: '(?i)^["'']?(?!(?:GOOGLE_API_ENABLE_RUNTIME_BOUND_TOKEN|GOOGLE_API_PREVENT_AGENT_TOKEN_SHARING_FOR_GCP_SERVICES)["'']?$).*(?:API_KEY|CLIENT_SECRET|_SECRET|_PASSWORD|_TOKEN(?![A-Za-z0-9_])|PRIVATE_KEY|GOOGLE_APPLICATION_CREDENTIALS)'
+          - patterns:
+              - pattern: |
+                  $KEY: $VALUE
+              - metavariable-regex:
+                  metavariable: $KEY
+                  regex: '^["'']?GOOGLE_API_KEY["'']?$'
+      # Literal one-line scalars only: skip empty values, ${VAR} / $(cmd) / {{ tmpl }}
+      # substitutions, Secret Manager resource names and nested mappings or lists.
+      - metavariable-regex:
+          metavariable: $VALUE
+          regex: '^(?!["'']{2}$)(?!["'']?\s*(?:\$\{|\$\(|\{\{))(?!.*projects/[^/\s]+/secrets/)[^{}\[\]\n]+$'
+
+  # ----------------------------------------------------------------------------
+  # L5-04: Plaintext API keys / secrets in JSON deploy configs
+  # ----------------------------------------------------------------------------
+  - id: gcp-secret-in-deploy-config-json
+    message: >-
+      [L5-04 | Layer 5 | gcp-gemini] JSON deploy config (for example an
+      Agent Engine config file) embeds a literal value for secret-named key
+      $KEY (in "env_vars", or GOOGLE_API_KEY anywhere), committing the
+      credential to source in plaintext. Reference Secret Manager and prefer
+      keyless Vertex AI authentication over GOOGLE_API_KEY.
+    severity: ERROR
+    languages: [json]
+    metadata:
+      control_id: "L5-04"
+      rule_pack: "gcp-gemini"
+      layer: "Layer 5: Resilience, Telemetry & Secure Delivery Gates"
+      category: security
+      cwe: "CWE-798: Use of Hard-coded Credentials"
+      owasp_asi: "ASI03"
+      severity_tier: "HIGH"
+      title: "Plaintext Secret in JSON Deploy Config"
+      recommended_fix: "Replace the literal with a Secret Manager reference (\"API_KEY\": {\"secret\": \"api-key\", \"version\": \"latest\"}), grant roles/secretmanager.secretAccessor to the runtime service account, and use Vertex AI with Application Default Credentials instead of GOOGLE_API_KEY."
+    patterns:
+      - pattern-either:
+          - patterns:
+              - pattern-inside: |
+                  "env_vars": {...}
+              - pattern: |
+                  "$KEY": $VALUE
+              - metavariable-regex:
+                  metavariable: $KEY
+                  regex: '(?i)^["'']?(?!(?:GOOGLE_API_ENABLE_RUNTIME_BOUND_TOKEN|GOOGLE_API_PREVENT_AGENT_TOKEN_SHARING_FOR_GCP_SERVICES)["'']?$).*(?:API_KEY|CLIENT_SECRET|_SECRET|_PASSWORD|_TOKEN(?![A-Za-z0-9_])|PRIVATE_KEY|GOOGLE_APPLICATION_CREDENTIALS)'
+          - patterns:
+              - pattern: |
+                  "$KEY": $VALUE
+              - metavariable-regex:
+                  metavariable: $KEY
+                  regex: '^["'']?GOOGLE_API_KEY["'']?$'
+      - metavariable-regex:
+          metavariable: $VALUE
+          regex: '^(?!["'']{2}$)(?!["'']?\s*(?:\$\{|\$\(|\{\{))(?!.*projects/[^/\s]+/secrets/)[^{}\[\]\n]+$'
+
+  # ----------------------------------------------------------------------------
+  # L5-04: Terraform-managed service account keys
+  # ----------------------------------------------------------------------------
+  - id: gcp-terraform-service-account-key
+    message: >-
+      [L5-04 | Layer 5 | gcp-gemini] Terraform creates a `google_service_account_key`
+      ($NAME), minting a long-lived key whose private material is also written
+      to Terraform state. Use keyless identities (attached service accounts,
+      Workload Identity, Agent Identity) instead.
+    severity: ERROR
+    languages: [hcl]
+    metadata:
+      control_id: "L5-04"
+      rule_pack: "gcp-gemini"
+      layer: "Layer 5: Resilience, Telemetry & Secure Delivery Gates"
+      category: security
+      cwe: "CWE-522: Insufficiently Protected Credentials"
+      owasp_asi: "ASI03"
+      severity_tier: "HIGH"
+      title: "Terraform Service Account Key Resource"
+      recommended_fix: "Remove the google_service_account_key resource; attach the service account to the runtime or grant roles/iam.workloadIdentityUser via google_service_account_iam_member for GKE Workload Identity, and enforce the iam.disableServiceAccountKeyCreation org policy."
+    pattern: |
+      resource "google_service_account_key" $NAME {
+        ...
+      }

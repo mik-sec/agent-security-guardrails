@@ -1,0 +1,2023 @@
+# Copyright 2026 The Agent Security Guardrails Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# ==============================================================================
+# Agent Security Guardrails — Core ADK Ruleset (L1-01..L5-04, rule_pack: adk-core)
+#
+# This file is the control catalog for scanner/scan_agent_codebase.py (titles,
+# severities, fixes) and the declarative mirror of its ADK-specific checks.
+# Every rule here targets a google-adk API. Optional packs live next to it:
+#
+#   rules/mcp.yaml          MCP client/server hardening (DNS rebinding, pinned
+#                           and non-auto-approved servers, token passthrough,
+#                           schema $ref, sampling, JSON-RPC IDs)
+#   rules/gcp-gemini.yaml   Google Cloud + Gemini SDK checks (safety settings,
+#                           direct Gemini calls, Model Armor clients, keyless
+#                           auth, Terraform service-account keys)
+#
+# Out of scope (use a general SAST, secrets, and dependency scanner): generic
+# code vulnerabilities (SQL injection, SSRF, command injection, unsafe
+# deserialization, path traversal), committed secrets, and vulnerable
+# dependencies.
+#
+# Compatible with Opengrep and Semgrep OSS:
+#   opengrep scan --config rules/adk-core.yaml <path>
+# ==============================================================================
+
+rules:
+  # ----------------------------------------------------------------------------
+  # L1-01: Layer 1 — Callable InstructionProvider & {var} Interpolation Block
+  # ----------------------------------------------------------------------------
+  - id: adk-prompt-var-interpolation
+    message: >-
+      [L1-01 | Layer 1 | adk-core] Detected an f-string or raw '{var}'
+      placeholder in an LlmAgent/Agent `instruction` or in a module-level prompt
+      constant. ADK's `inject_session_state` interpolates `{var}` and
+      `{artifact.*}` tokens from `session.state`, so untrusted state can inject
+      instructions or crash the turn with a KeyError. Pass a callable
+      InstructionProvider (`def provider(ctx: ReadonlyContext) -> str`), which
+      ADK does not interpolate, and fence untrusted values in XML tags followed
+      by a closing security reminder.
+    severity: ERROR
+    languages: [python]
+    metadata:
+      control_id: L1-01
+      rule_pack: adk-core
+      layer: "Layer 1: Prompt, Model & State Integrity"
+      module: "google.adk"
+      category: security
+      cwe: "CWE-74: Improper Neutralization of Special Elements in Output Used by a Downstream Component"
+      owasp_agentic: "ASI01: Agent Goal Hijack"
+      owasp_llm: "LLM01:2025 Prompt Injection"
+      severity_tier: "CRITICAL"
+      owasp_asi: "ASI01"
+      core_module: "google.adk"
+      title: "Callable InstructionProvider & {var} Interpolation Block"
+      security_invariant: "System instructions must be invariant to untrusted session state; all dynamic context must be wrapped in <untrusted_context> with a 3-Part Sandwich Defense closing <security_postamble>."
+      recommended_fix: "Replace f-strings and raw '{var}' placeholders with a callable InstructionProvider(ctx: ReadonlyContext) that fences untrusted values in XML tags."
+    pattern-either:
+      - pattern: LlmAgent(..., instruction=f"...", ...)
+      - pattern: Agent(..., instruction=f"...", ...)
+      - pattern: LlmAgent(..., global_instruction=f"...", ...)
+      - pattern: Agent(..., global_instruction=f"...", ...)
+      - pattern: inject_session_state(..., use_jinja2=True, ...)
+      - patterns:
+          - pattern-either:
+              - pattern: LlmAgent(..., instruction="$INSTR", ...)
+              - pattern: Agent(..., instruction="$INSTR", ...)
+          - metavariable-regex:
+              metavariable: $INSTR
+              regex: '(?s)^(?:```(?:(?!```)[\s\S])*```|`[^`\n]+`|\{\{[^}]*\}\}|`(?!``)(?![^`\n]*`)|[^{`])*?(?<!\{)\{[a-zA-Z_][a-zA-Z0-9_.:]*\??\}(?!\})'
+      - patterns:
+          - pattern: $PROMPT_VAR = "$INSTR"
+          - metavariable-regex:
+              metavariable: $PROMPT_VAR
+              regex: "^(?:.*_)?(?:PROMPT|INSTRUCTION|INSTRUCTIONS|SYSTEM_PROMPT)$"
+          - metavariable-regex:
+              metavariable: $INSTR
+              regex: '(?s)^(?:```(?:(?!```)[\s\S])*```|`[^`\n]+`|\{\{[^}]*\}\}|`(?!``)(?![^`\n]*`)|[^{`])*?(?<!\{)\{[a-zA-Z_][a-zA-Z0-9_.:]*\??\}(?!\})'
+          - pattern-either:
+              - pattern-inside: |
+                  import google.adk
+                  ...
+              - pattern-inside: |
+                  import google.adk.$SUB
+                  ...
+              - pattern-inside: |
+                  from google.adk import $IMP
+                  ...
+              - pattern-inside: |
+                  from google.adk.$SUB import $IMP
+                  ...
+              - pattern-inside: |
+                  from google.adk.$SUB.$SUB2 import $IMP
+                  ...
+              - pattern-inside: |
+                  ...
+                  LlmAgent(...)
+                  ...
+              - pattern-inside: |
+                  ...
+                  Agent(...)
+                  ...
+              - patterns:
+                  - pattern: $PROMPT_VAR = "$INSTR"
+                  - metavariable-regex:
+                      metavariable: $INSTR
+                      regex: "(?s).*(?<!\\{)\\{(?:(?:user|app|temp):[a-zA-Z0-9_.:]+|artifact\\.[a-zA-Z0-9_.:]+|[a-zA-Z_][a-zA-Z0-9_.:]*\\?)\\}(?!\\}).*"
+          - pattern-not-inside: |
+              $PROMPT_VAR = "$INSTR"
+              ...
+              <... $PROMPT_VAR.format(...) ...>
+          - pattern-not-inside: |
+              $PROMPT_VAR = "$INSTR"
+              ...
+              <... $PROMPT_VAR.format_map(...) ...>
+
+  # ----------------------------------------------------------------------------
+  # L1-02: Layer 1 — Pinned Model Version on ADK agents
+  # (Gemini SDK safety-threshold checks: optional gcp-gemini pack)
+  # ----------------------------------------------------------------------------
+  - id: adk-model-missing-safety-config
+    message: >-
+      [L1-02 | Layer 1 | adk-core] LlmAgent/Agent `model=` uses a mutable model
+      alias (`*-latest`, `*-exp`). The model behind an alias can change without
+      a code change, silently invalidating safety and behavior evaluations.
+      Pin an immutable model version. Gemini safety-threshold and direct
+      Gemini SDK checks are in the optional gcp-gemini pack.
+    severity: WARNING
+    languages: [python]
+    metadata:
+      control_id: L1-02
+      rule_pack: adk-core
+      layer: "Layer 1: Prompt, Model & State Integrity"
+      module: "google.adk.agents.LlmAgent"
+      category: security
+      cwe: "CWE-693: Protection Mechanism Failure"
+      owasp_agentic: "ASI01: Agent Goal Hijack"
+      owasp_llm: "LLM01:2025 Prompt Injection"
+      severity_tier: "HIGH"
+      owasp_asi: "ASI01"
+      core_module: "google.adk.agents.LlmAgent"
+      title: "Pinned Model Version & Hardened Safety Thresholds"
+      security_invariant: "Model identifier must be pinned to an immutable release version (no '-latest' or '-exp' aliases) and safety thresholds must enforce BLOCK_LOW_AND_ABOVE across all harm categories."
+      recommended_fix: "Pin LlmAgent(model=...) to an immutable Gemini release and set generate_content_config=types.GenerateContentConfig(safety_settings=[...]) with HarmBlockThreshold.BLOCK_LOW_AND_ABOVE."
+    patterns:
+      - pattern-either:
+          - pattern: LlmAgent(..., model="$MODEL", ...)
+          - pattern: Agent(..., model="$MODEL", ...)
+      - metavariable-regex:
+          metavariable: $MODEL
+          regex: "(?i)^(.*latest.*|.*-exp)$"
+
+  # ----------------------------------------------------------------------------
+  # L1-03: Layer 1 — Inline ModelArmorPlugin & ToolCallIntegrityPlugin
+  # ----------------------------------------------------------------------------
+  - id: adk-guardrail-missing-model-armor
+    message: >-
+      [L1-03 | Layer 1 | adk-core] `Runner`, `InMemoryRunner`, or `App(root_agent=...)`
+      created without `plugins=`. Production ADK apps must register
+      `ModelArmorPlugin` (prompt and response screening, including binary
+      attachments) and `ToolCallIntegrityPlugin` (HMAC-signed tool calls).
+    severity: ERROR
+    languages: [python]
+    metadata:
+      control_id: L1-03
+      rule_pack: adk-core
+      layer: "Layer 1: Prompt, Model & State Integrity"
+      module: "google.adk"
+      category: security
+      cwe: "CWE-693: Protection Mechanism Failure"
+      owasp_agentic: "ASI01: Agent Goal Hijack"
+      owasp_llm: "LLM01:2025 Prompt Injection"
+      severity_tier: "HIGH"
+      owasp_asi: "ASI01"
+      core_module: "google.adk.integrations.model_armor.ModelArmorPlugin"
+      title: "Inline ModelArmorPlugin, ByteDataItem Screening & Tool-Call HMAC Integrity"
+      security_invariant: "Every App and Runner must enforce inline ingress/egress prompt-injection screening (ModelArmorPlugin + ByteDataItem binary screening) and ToolCallIntegrityPlugin HMAC-SHA256 signing."
+      recommended_fix: "Register native ModelArmorPlugin(config=ModelArmorConfig(...)) and ToolCallIntegrityPlugin(secret_key=...) on the App or Runner."
+    patterns:
+      - pattern-either:
+          - pattern: Runner(...)
+          - pattern: InMemoryRunner(...)
+          - pattern: App(..., root_agent=..., ...)
+      - pattern-not: Runner(..., plugins=..., ...)
+      - pattern-not: Runner(..., app=..., ...)
+      - pattern-not: InMemoryRunner(..., plugins=..., ...)
+      - pattern-not: App(..., plugins=..., ...)
+
+  # ----------------------------------------------------------------------------
+  # L1-04: Layer 1 — Scoped Session State & Colon-Prefix Validation
+  # ----------------------------------------------------------------------------
+  - id: adk-state-unscoped-colon-mutation
+    message: >-
+      [L1-04 | Layer 1 | adk-core] Direct mutation of a privileged, global, or
+      ADK-internal session state key (`app:*`, `user:*`, `auth:*`, `role:*`,
+      `user_id`, `permissions`, `tenant_id`, `sandbox_name`,
+      `_code_execution_context`, `_code_executor_input_files`,
+      `_adk_activated_skills_*`) via raw `.state[...]` or `.state.update(...)`.
+      Colon-prefixed keys bypass `state_schema` validation, and mutating `app:*`
+      or `sandbox_name` poisons global state or hijacks sandboxes across tenants.
+      Route updates through a validation step such as a `validate_state_delta()`
+      helper.
+    severity: ERROR
+    languages: [python]
+    metadata:
+      control_id: L1-04
+      rule_pack: adk-core
+      layer: "Layer 1: Prompt, Model & State Integrity"
+      module: "google.adk"
+      category: security
+      cwe: "CWE-668: Exposure of Resource to Wrong Sphere"
+      owasp_agentic: "ASI03: Identity & Privilege Abuse"
+      owasp_llm: "LLM06:2025 Sensitive Information Disclosure"
+      severity_tier: "HIGH"
+      owasp_asi: "ASI06"
+      core_module: "google.adk"
+      title: "Scoped Session State & Colon-Prefix Validation"
+      security_invariant: "Colon-prefixed and internal session state keys (app:*, user:*, auth:*, role:*, sandbox_name, _code_execution_context, _adk_activated_skills_*) must never be mutated via raw state[...]."
+      recommended_fix: "Validate session state updates via a validate_state_delta() helper before writing them."
+    pattern-either:
+      - patterns:
+          - pattern-either:
+              - pattern: $CTX.state["$KEY"] = $VAL
+              - pattern: $CTX.state['$KEY'] = $VAL
+              - pattern: '$CTX.state.update({ "$KEY": $VAL, ... })'
+          - metavariable-regex:
+              metavariable: $KEY
+              regex: "^(app:.*|user:.*|auth:.*|role:.*|user_id|permissions|is_admin|tenant_id|_verified_user_id|sandbox_name|_code_execution_context|_code_executor_input_files|_adk_activated_skills_.*)$"
+      - patterns:
+          - pattern: |
+              $KEY_VAR = "$KEY"
+              ...
+              $CTX.state[$KEY_VAR] = $VAL
+          - metavariable-regex:
+              metavariable: $KEY
+              regex: "^(app:.*|user:.*|auth:.*|role:.*|user_id|permissions|is_admin|tenant_id|_verified_user_id|sandbox_name|_code_execution_context|_code_executor_input_files|_adk_activated_skills_.*)$"
+
+  # ----------------------------------------------------------------------------
+  # L2-01: Layer 2 — Encrypted ADK Credential Store & S256 PKCE
+  # (runtime-bound token env checks: optional gcp-gemini pack)
+  # ----------------------------------------------------------------------------
+  - id: adk-auth-disabled-runtime-bound-token
+    message: >-
+      [L2-01 | Layer 2 | adk-core] OAuth credentials stored in plaintext ADK
+      session state (`SessionStateCredentialService`, or a token written to
+      `state[...]`), or an OAuth flow configured with a PKCE
+      `code_challenge_method` other than `S256`. Encrypt stored credentials with
+      `GOOGLE_CREDENTIAL_KMS_KEY` and enforce S256 PKCE. Runtime-bound token
+      environment checks are in the optional gcp-gemini pack.
+    severity: ERROR
+    languages: [python]
+    metadata:
+      control_id: L2-01
+      rule_pack: adk-core
+      layer: "Layer 2: Identity, Auth & Least-Privilege IAM"
+      module: "GOOGLE_CREDENTIAL_KMS_KEY"
+      category: security
+      cwe: "CWE-294: Authentication Bypass by Capture-replay"
+      owasp_agentic: "ASI03: Identity & Privilege Abuse"
+      owasp_llm: "LLM06:2025 Excessive Agency"
+      severity_tier: "CRITICAL"
+      owasp_asi: "ASI03"
+      core_module: "google.adk.auth"
+      title: "Runtime-Bound Tokens, S256 PKCE & KMS Credential Store"
+      security_invariant: "GOOGLE_API_ENABLE_RUNTIME_BOUND_TOKEN must remain 'true', OAuth2 flows must enforce S256 PKCE, and credential stores must bind to a Cloud KMS key (GOOGLE_CREDENTIAL_KMS_KEY)."
+      recommended_fix: "Configure GOOGLE_CREDENTIAL_KMS_KEY for the ADK credential service, never write OAuth tokens to session state, and set code_challenge_method='S256'."
+    pattern-either:
+      - pattern: SessionStateCredentialService(...)
+      - pattern: $CTX.state[$KEY] = $CREDS.to_json(...)
+      - pattern: $CTX.state["token_cache"][$KEY] = $VAL
+      - patterns:
+          - pattern-either:
+              - pattern: $CTX.state["$TOKEN_KEY"] = $VAL
+              - pattern: $CTX.state['$TOKEN_KEY'] = $VAL
+          - metavariable-regex:
+              metavariable: $TOKEN_KEY
+              regex: "(?i).*(access_token|refresh_token|client_secret|token_cache|oauth_token|bearer_token).*"
+      - patterns:
+          - pattern: $AUTH(..., code_challenge_method=$METHOD, ...)
+          - pattern-not: $AUTH(..., code_challenge_method="S256", ...)
+
+  - id: adk-auth-credential-in-tool-signature
+    message: >-
+      [L2-01 | Layer 2 | adk-core] Tool function `$TOOL` exposes credential
+      parameter `$CRED` to LLM population. Passing tokens, API keys, or
+      passwords as tool arguments leaks secrets into model prompts, session
+      history, and traces. Retrieve runtime-bound credentials server-side from
+      the ADK KMS-encrypted credential service via `tool_context`.
+    severity: ERROR
+    languages: [python]
+    metadata:
+      control_id: L2-01
+      rule_pack: adk-core
+      layer: "Layer 2: Identity, Auth & Least-Privilege IAM"
+      module: "GOOGLE_CREDENTIAL_KMS_KEY"
+      category: security
+      cwe: "CWE-522: Insufficiently Protected Credentials"
+      owasp_agentic: "ASI03: Identity & Privilege Abuse"
+      owasp_llm: "LLM02:2025 Sensitive Information Disclosure"
+      severity_tier: "CRITICAL"
+      owasp_asi: "ASI03/ASI06"
+      core_module: "google.adk.auth"
+      title: "No Raw Credential Parameters in LLM Tool Signatures"
+      security_invariant: "Tool signatures must never accept access_token, bearer_token, api_key, client_secret, or password from the LLM; retrieve credentials server-side via ADK credential services."
+      recommended_fix: "Remove credential parameters from the tool signature and fetch scoped credentials server-side via tool_context or Secret Manager."
+    patterns:
+      - pattern-either:
+          - pattern: |
+              def $TOOL(..., $CRED: $CT, ..., tool_context: $T, ...):
+                ...
+          - pattern: |
+              def $TOOL(..., tool_context: $T, ..., $CRED: $CT, ...):
+                ...
+          - pattern: |
+              def $TOOL(..., $CRED, ..., tool_context, ...):
+                ...
+          - pattern: |
+              def $TOOL(..., tool_context, ..., $CRED, ...):
+                ...
+          - patterns:
+              - pattern-either:
+                  - pattern: |
+                      def $TOOL(..., $CRED: $CT, ...):
+                        ...
+                  - pattern: |
+                      def $TOOL(..., $CRED, ...):
+                        ...
+              - pattern-either:
+                  - pattern-inside: |
+                      ...
+                      FunctionTool($TOOL, ...)
+                  - pattern-inside: |
+                      ...
+                      FunctionTool(..., func=$TOOL, ...)
+                  - pattern-inside: |
+                      ...
+                      LongRunningFunctionTool($TOOL, ...)
+                  - pattern-inside: |
+                      ...
+                      LongRunningFunctionTool(..., func=$TOOL, ...)
+                  - pattern-inside: |
+                      ...
+                      LlmAgent(..., tools=[..., $TOOL, ...], ...)
+                  - pattern-inside: |
+                      ...
+                      Agent(..., tools=[..., $TOOL, ...], ...)
+      - metavariable-regex:
+          metavariable: $CRED
+          regex: '^(?:access_token|refresh_token|bearer_token|id_token|oauth_token|auth_token|api_key|apikey|client_secret|password|passwd|secret_key|private_key)$'
+      - pattern-not-inside: |
+          @$ROUTER.get(...)
+          def $TOOL(...):
+            ...
+      - pattern-not-inside: |
+          @$ROUTER.post(...)
+          def $TOOL(...):
+            ...
+      - pattern-not-inside: |
+          @$ROUTER.put(...)
+          def $TOOL(...):
+            ...
+      - pattern-not-inside: |
+          @$ROUTER.delete(...)
+          def $TOOL(...):
+            ...
+      - pattern-not-inside: |
+          @$ROUTER.patch(...)
+          def $TOOL(...):
+            ...
+
+  # ----------------------------------------------------------------------------
+  # L2-02: Layer 2 — Server-Side Caller Identity Binding & Deny-by-Default RBAC
+  # ----------------------------------------------------------------------------
+  - id: adk-rbac-llm-controlled-user-id
+    message: >-
+      [L2-02 | Layer 2 | adk-core] A tool function accepts `user_id` or
+      `tenant_id` as an LLM-populated parameter instead of reading the
+      authenticated caller from `tool_context.user_id`, or a session service is
+      queried with `list_sessions(user_id=None)` across all tenants. Prompt
+      injection can spoof the identifier and cause Broken Object Level
+      Authorization (BOLA / IDOR). Remove identity parameters from the tool
+      signature and bind identity server-side from `tool_context` (for example a
+      `bind_authenticated_user(tool_context)` helper).
+    severity: ERROR
+    languages: [python]
+    metadata:
+      control_id: L2-02
+      rule_pack: adk-core
+      layer: "Layer 2: Identity, Auth & Least-Privilege IAM"
+      module: "google.adk"
+      category: security
+      cwe: "CWE-639: Authorization Bypass Through User-Controlled Key"
+      owasp_agentic: "ASI03: Identity & Privilege Abuse"
+      owasp_llm: "LLM06:2025 Excessive Agency"
+      severity_tier: "CRITICAL"
+      owasp_asi: "ASI03"
+      core_module: "google.adk"
+      title: "Server-Side Caller Identity Binding & Semantic BOLA Prevention"
+      security_invariant: "Tool signatures must never expose user_id, tenant_id, owner_id, account_id, or caller_role to the LLM; all resource queries must join against server-verified tool_context.user_id."
+      recommended_fix: "Remove identity parameters from the tool signature, resolve caller identity server-side from tool_context, and always pass user_id to list_sessions()."
+    pattern-either:
+      - patterns:
+          - pattern-either:
+              - pattern: |
+                  def $TOOL(..., user_id: str, ..., tool_context: $T, ...):
+                      ...
+              - pattern: |
+                  def $TOOL(..., tool_context: $T, ..., user_id: str, ...):
+                      ...
+              - pattern: |
+                  def $TOOL(..., tenant_id: str, ..., tool_context: $T, ...):
+                      ...
+              - pattern: |
+                  def $TOOL(..., tool_context: $T, ..., tenant_id: str, ...):
+                      ...
+          - pattern-not-inside: |
+              @$ROUTER.get(...)
+              def $TOOL(...):
+                  ...
+          - pattern-not-inside: |
+              @$ROUTER.post(...)
+              def $TOOL(...):
+                  ...
+          - pattern-not-inside: |
+              @$ROUTER.put(...)
+              def $TOOL(...):
+                  ...
+          - pattern-not-inside: |
+              @$ROUTER.delete(...)
+              def $TOOL(...):
+                  ...
+          - pattern-not-inside: |
+              @$ROUTER.patch(...)
+              def $TOOL(...):
+                  ...
+      - pattern: $SVC.list_sessions(..., user_id=None, ...)
+
+  # ----------------------------------------------------------------------------
+  # L2-03: Layer 2 — Hardened ADK API Server, CORS Lockdown & Trigger Auth
+  # ----------------------------------------------------------------------------
+  - id: adk-server-unauthenticated-fastapi-app
+    message: >-
+      [L2-03 | Layer 2 | adk-core] Detected `get_fast_api_app(..., web=True)`,
+      wildcard `"*"` in `allow_origins`, trigger endpoints (`trigger_sources=...`),
+      or `TriggerRouter(verifier=None)`. ADK's `get_fast_api_app()` mounts `/run`,
+      `/run_sse`, session (`state_delta`), and builder routes with no built-in
+      authentication, and `"*"` in `allow_origins` disables ADK's Origin and
+      DNS-rebinding check while reflecting arbitrary caller origins with
+      credentials enabled. Pass `web=False` and an explicit `allow_origins` list,
+      put the server behind authenticated ingress (IAP or Cloud Run IAM), and
+      verify triggers with `trigger_oidc_audience` +
+      `trigger_oidc_service_accounts` (or `GoogleOidcVerifier(audience,
+      allowed_emails=[...])`).
+    severity: ERROR
+    languages: [python]
+    metadata:
+      control_id: L2-03
+      rule_pack: adk-core
+      layer: "Layer 2: Identity, Auth & Least-Privilege IAM"
+      module: "google.adk"
+      category: security
+      cwe: "CWE-306: Missing Authentication for Critical Function"
+      owasp_agentic: "ASI03: Identity & Privilege Abuse"
+      owasp_llm: "LLM06:2025 Excessive Agency"
+      severity_tier: "CRITICAL"
+      owasp_asi: "ASI03"
+      core_module: "google.adk.cli.fast_api"
+      title: "Hardened FastAPI Server, Strict CORS & state_delta Middleware"
+      security_invariant: "FastAPI servers must disable unauthenticated web UI (web=False), reject wildcard CORS ('*'), sanitize HTTP state_delta, and verify trigger OIDC tokens against an explicit service-account allowlist (trigger_oidc_service_accounts or GoogleOidcVerifier allowed_emails)."
+      recommended_fix: "Configure get_fast_api_app(web=False, allow_origins=[<explicit origins>]), serve it behind authenticated ingress, validate client state_delta with validate_state_delta(), and pass trigger_oidc_audience plus a non-empty trigger_oidc_service_accounts list (or GoogleOidcVerifier(audience, allowed_emails=[...])) for triggers."
+    pattern-either:
+      - pattern: get_fast_api_app(..., web=True, ...)
+      - pattern: $M.get_fast_api_app(..., web=True, ...)
+      - patterns:
+          - pattern-inside: |
+              $W = True
+              ...
+          - pattern-either:
+              - pattern: get_fast_api_app(..., web=$W, ...)
+              - pattern: $M.get_fast_api_app(..., web=$W, ...)
+      - pattern: get_fast_api_app(..., allow_origins=[..., "*", ...], ...)
+      - pattern: $M.get_fast_api_app(..., allow_origins=[..., "*", ...], ...)
+      - patterns:
+          - pattern-inside: |
+              $X = [..., "*", ...]
+              ...
+          - pattern-either:
+              - pattern: get_fast_api_app(..., allow_origins=$X, ...)
+              - pattern: $M.get_fast_api_app(..., allow_origins=$X, ...)
+      - patterns:
+          - pattern-either:
+              - pattern: get_fast_api_app(..., trigger_sources=$TS, ...)
+              - pattern: $M.get_fast_api_app(..., trigger_sources=$TS, ...)
+          - pattern-not: get_fast_api_app(..., trigger_sources=None, ...)
+          - pattern-not: $M.get_fast_api_app(..., trigger_sources=None, ...)
+          - pattern-not: get_fast_api_app(..., trigger_sources=[], ...)
+          - pattern-not: $M.get_fast_api_app(..., trigger_sources=[], ...)
+          - pattern-not: get_fast_api_app(..., trigger_sources=(), ...)
+          - pattern-not: $M.get_fast_api_app(..., trigger_sources=(), ...)
+          - pattern-not: get_fast_api_app(..., trigger_auth_verifier=$VERIFIER, ...)
+          - pattern-not: $M.get_fast_api_app(..., trigger_auth_verifier=$VERIFIER, ...)
+          - pattern-not: get_fast_api_app(..., trigger_oidc_audience=$AUD, trigger_oidc_service_accounts=[$SA, ...], ...)
+          - pattern-not: $M.get_fast_api_app(..., trigger_oidc_audience=$AUD, trigger_oidc_service_accounts=[$SA, ...], ...)
+      - pattern: TriggerRouter(..., verifier=None, ...)
+      - pattern: $M.TriggerRouter(..., verifier=None, ...)
+
+  # ----------------------------------------------------------------------------
+  # L3-01: Layer 3 — Programmatic HITL Confirmation & Strict Input Schemas
+  # ----------------------------------------------------------------------------
+  - id: adk-tool-missing-hitl-confirmation
+    message: >-
+      [L3-01 | Layer 3 | adk-core] State-mutating `FunctionTool` (`delete_*`,
+      `update_*`, `grant_*`, `transfer_*`, `execute_*`, `send_*`, `approve_*`,
+      `write_*`) or write-capable `ApplicationIntegrationToolset` registered
+      without `require_confirmation=True`, or `GCSAdminToolset` registered
+      without a `tool_filter` allowlist. Autonomous state mutation completes the
+      lethal trifecta. Use `FunctionTool(func, require_confirmation=True)` or
+      `tool_context.request_confirmation()`, and restrict `GCSAdminToolset` to
+      read-only tools with `tool_filter=[...]`.
+    severity: ERROR
+    languages: [python]
+    metadata:
+      control_id: L3-01
+      rule_pack: adk-core
+      layer: "Layer 3: Tool, Data Connector & Network Safety"
+      module: "google.adk"
+      category: security
+      cwe: "CWE-862: Missing Authorization"
+      owasp_agentic: "ASI02: Tool Misuse & Exploitation"
+      owasp_llm: "LLM06:2025 Excessive Agency"
+      severity_tier: "CRITICAL"
+      owasp_asi: "ASI02/ASI09"
+      core_module: "google.adk.tools.FunctionTool"
+      title: "Programmatic HITL Confirmation & Static Tool Splitting"
+      security_invariant: "Every state-mutating tool must enforce require_confirmation=True (or a secondary intent verifier) to break Leg 3 of the Lethal Trifecta."
+      recommended_fix: "Wrap state-mutating functions with FunctionTool(fn, require_confirmation=True) or call tool_context.request_confirmation(); restrict GCSAdminToolset with tool_filter=[...]."
+    pattern-either:
+      - patterns:
+          - pattern-either:
+              - pattern: FunctionTool($FUNC)
+              - pattern: FunctionTool(func=$FUNC)
+              - pattern: FunctionTool($FUNC, require_confirmation=False, ...)
+              - pattern: FunctionTool(func=$FUNC, require_confirmation=False, ...)
+          - pattern-not: FunctionTool(..., require_confirmation=True, ...)
+          - metavariable-regex:
+              metavariable: $FUNC
+              regex: "^(delete_|remove_|destroy_|drop_|update_|modify_|grant_|revoke_|transfer_|execute_|write_|send_|approve_).*"
+      - patterns:
+          - pattern: ApplicationIntegrationToolset(...)
+          - pattern-not: ApplicationIntegrationToolset(..., require_confirmation=True, ...)
+      - pattern-either:
+          - patterns:
+              - pattern: GCSAdminToolset(...)
+              - pattern-not: GCSAdminToolset(..., tool_filter=$FILTER, ...)
+          - pattern: GCSAdminToolset(..., tool_filter=None, ...)
+
+  - id: adk-tool-unconstrained-kwargs
+    message: >-
+      [L3-01 | Layer 3 | adk-core] Registered ADK tool function `$TOOL` accepts
+      unconstrained `**$KW` keyword arguments, bypassing strict tool input
+      schema validation and letting a prompt-injected model pass unexpected
+      arguments to downstream APIs. Declare explicit, strictly typed parameters
+      on every agent tool.
+    severity: WARNING
+    languages: [python]
+    metadata:
+      control_id: L3-01
+      rule_pack: adk-core
+      layer: "Layer 3: Tool, Data Connector & Network Safety"
+      module: "google.adk"
+      category: security
+      cwe: "CWE-20: Improper Input Validation"
+      owasp_agentic: "ASI02: Tool Misuse & Exploitation"
+      owasp_llm: "LLM06:2025 Excessive Agency"
+      severity_tier: "HIGH"
+      owasp_asi: "ASI02"
+      core_module: "google.adk.tools.FunctionTool"
+      title: "Strict Typed Tool Input Schemas Without Wildcard **kwargs"
+      security_invariant: "Registered ADK tool functions must declare explicit typed parameters and never accept arbitrary **kwargs from the LLM."
+      recommended_fix: "Replace **kwargs on registered ADK tool functions with explicit typed parameters or a validated Pydantic model."
+    patterns:
+      - metavariable-regex:
+          metavariable: $TOOL
+          regex: '^[A-Za-z]'
+      - pattern-either:
+          - patterns:
+              - pattern: |
+                  def $TOOL(..., **$KW):
+                    ...
+              - pattern-either:
+                  - pattern-inside: |
+                      ...
+                      FunctionTool($TOOL, ...)
+                  - pattern-inside: |
+                      ...
+                      FunctionTool(..., func=$TOOL, ...)
+                  - pattern-inside: |
+                      ...
+                      LongRunningFunctionTool($TOOL, ...)
+                  - pattern-inside: |
+                      ...
+                      LongRunningFunctionTool(..., func=$TOOL, ...)
+                  - pattern-inside: |
+                      ...
+                      LlmAgent(..., tools=[..., $TOOL, ...], ...)
+                  - pattern-inside: |
+                      ...
+                      Agent(..., tools=[..., $TOOL, ...], ...)
+          - patterns:
+              - pattern: |
+                  def $TOOL(..., tool_context: $T, ..., **$KW):
+                    ...
+              - metavariable-regex:
+                  metavariable: $T
+                  regex: '^(?:.*\.)?ToolContext$'
+
+  # ----------------------------------------------------------------------------
+  # L3-02: Layer 3 — Untrusted Tool Output Delimiters & Markdown Sanitizer
+  # ----------------------------------------------------------------------------
+  - id: adk-tool-unwrapped-untrusted-output
+    message: >-
+      [L3-02 | Layer 3 | adk-core] An agent registers MCP tools (`McpToolset`,
+      `LoadMcpResourceTool`) without an `after_tool_callback`. MCP server and
+      resource output is untrusted content that can carry indirect prompt
+      injection or Markdown image beacons. Add an `after_tool_callback` that
+      fences the output in `<untrusted_tool_output>` tags and strips Markdown
+      images, such as a `wrap_tool_output()` helper.
+    severity: WARNING
+    languages: [python]
+    metadata:
+      control_id: L3-02
+      rule_pack: adk-core
+      layer: "Layer 3: Tool, Data Connector & Network Safety"
+      module: "google.adk"
+      category: security
+      cwe: "CWE-209: Generation of Error Message Containing Sensitive Information"
+      owasp_agentic: "ASI06: Sensitive Information & Credential Leakage"
+      owasp_llm: "LLM05:2025 Improper Output Handling"
+      severity_tier: "HIGH"
+      owasp_asi: "ASI01"
+      core_module: "google.adk"
+      title: "Untrusted Tool Output Delimiters, Markdown Sanitizer & Opaque Errors"
+      security_invariant: "External retrieval and MCP resource outputs must be wrapped in <untrusted_tool_output> delimiters with Markdown image/link sanitization and opaque error IDs."
+      recommended_fix: "Register an after_tool_callback that wraps tool output (for example a wrap_tool_output() helper), and return opaque error references instead of raw exception text."
+    patterns:
+      - pattern-either:
+          - pattern: LlmAgent(..., tools=[..., McpToolset(...), ...], ...)
+          - pattern: Agent(..., tools=[..., McpToolset(...), ...], ...)
+          - pattern: LlmAgent(..., tools=[..., LoadMcpResourceTool(...), ...], ...)
+          - pattern: Agent(..., tools=[..., LoadMcpResourceTool(...), ...], ...)
+      - pattern-not: LlmAgent(..., after_tool_callback=$CB, ...)
+      - pattern-not: Agent(..., after_tool_callback=$CB, ...)
+
+  # ----------------------------------------------------------------------------
+  # L3-03: Layer 3 — Read-Only Retrieval, Constrained Toolsets & MCP Pinning
+  # ----------------------------------------------------------------------------
+  - id: adk-connector-unconstrained-bq-or-mcp
+    message: >-
+      [L3-03 | Layer 3 | adk-core] Detected a write-enabled or unconstrained ADK
+      connector: `BigQueryToolConfig(write_mode=WriteMode.ALLOWED)`,
+      `SpannerAdminToolset`, `OpenAPIToolset` / `RestApiTool` without
+      `tool_filter`, an MCP stdio server that inherits `os.environ`, or an MCP
+      server launched from an unpinned package (`-y`, `@latest`). Use
+      `BigQueryToolConfig(write_mode=WriteMode.BLOCKED)`, allowlist tools with
+      `tool_filter=[...]`, pass an explicit minimal `env={...}`, and pin MCP
+      server package versions. SQL injection in hand-written queries is out
+      of scope for this ruleset.
+    severity: ERROR
+    languages: [python]
+    metadata:
+      control_id: L3-03
+      rule_pack: adk-core
+      layer: "Layer 3: Tool, Data Connector & Network Safety"
+      module: "google.adk"
+      category: security
+      cwe: "CWE-89: Improper Neutralization of Special Elements used in an SQL Command"
+      owasp_agentic: "ASI02: Tool Misuse & Exploitation"
+      owasp_llm: "LLM02:2025 Sensitive Information Disclosure"
+      severity_tier: "CRITICAL"
+      owasp_asi: "ASI02/ASI04"
+      core_module: "google.adk.integrations.bigquery.config.BigQueryToolConfig"
+      title: "Read-Only Connectors, Parameterized SQL & Tenant-Scoped MCP"
+      security_invariant: "Database connectors must enforce WriteMode.BLOCKED and parameterized queries (@param); MCP toolsets must scope tool_filter and bind per-invocation tenant headers."
+      recommended_fix: "Use BigQueryToolConfig(write_mode=WriteMode.BLOCKED), McpToolset(tool_filter=[...], header_provider=<per-invocation tenant headers>), explicit MCP subprocess env, and pinned MCP server versions."
+    pattern-either:
+      - pattern: BigQueryToolConfig(..., write_mode=WriteMode.ALLOWED, ...)
+      - pattern: SpannerAdminToolset(...)
+      - patterns:
+          - pattern-either:
+              - pattern: OpenAPIToolset(...)
+              - pattern: RestApiTool(...)
+          - pattern-not: OpenAPIToolset(..., tool_filter=..., ...)
+          - pattern-not: OpenAPIToolset(..., require_confirmation=..., ...)
+          - pattern-not: RestApiTool(..., tool_filter=..., ...)
+          - pattern-not: RestApiTool(..., require_confirmation=..., ...)
+      - pattern: StdioServerParameters(..., env=os.environ, ...)
+      - pattern: StdioServerParameters(..., env=os.environ.copy(), ...)
+      - pattern: StdioServerParameters(..., env=dict(os.environ), ...)
+      - pattern: 'StdioServerParameters(..., env={**os.environ, ...}, ...)'
+      - pattern: StdioConnectionParams(..., env=os.environ, ...)
+      - pattern: StdioConnectionParams(..., env=os.environ.copy(), ...)
+      - pattern: StdioConnectionParams(..., env=dict(os.environ), ...)
+      - pattern: 'StdioConnectionParams(..., env={**os.environ, ...}, ...)'
+      - patterns:
+          - pattern-either:
+              - pattern: StdioServerParameters(..., args=[..., "$ARG", ...], ...)
+              - pattern: StdioConnectionParams(..., args=[..., "$ARG", ...], ...)
+          - metavariable-regex:
+              metavariable: $ARG
+              regex: '(?i)^(?:-y|--yes|.*@latest|--(?:api[-_]?key|access[-_]?token|refresh[-_]?token|bearer[-_]?token|auth[-_]?token|oauth[-_]?token|token|password|passwd|client[-_]?secret|secret[-_]?key)(?:=.*)?)$'
+
+  # ----------------------------------------------------------------------------
+  # L3-04: Layer 3 — Browser and Computer-Use Egress Control
+  # (SSRF in custom HTTP code: general SAST)
+  # ----------------------------------------------------------------------------
+  - id: adk-network-ssrf-unvalidated-http
+    message: >-
+      [L3-04 | Layer 3 | adk-core] `ComputerUseToolset` lets the model drive a
+      browser to arbitrary URLs, including cloud metadata (`169.254.169.254`),
+      loopback, and internal networks. Intercept navigation (for example a
+      Playwright `page.route` handler) and allow only approved destinations,
+      as a `validate_egress_url()` helper does for HTTP.
+      SSRF in custom HTTP client code is out of scope for this ruleset.
+    severity: WARNING
+    languages: [python]
+    metadata:
+      control_id: L3-04
+      rule_pack: adk-core
+      layer: "Layer 3: Tool, Data Connector & Network Safety"
+      module: "google.adk"
+      category: security
+      cwe: "CWE-918: Server-Side Request Forgery (SSRF)"
+      owasp_agentic: "ASI02: Tool Misuse & Exploitation"
+      owasp_llm: "LLM06:2025 Excessive Agency"
+      severity_tier: "HIGH"
+      owasp_asi: "ASI02"
+      core_module: "google.adk.tools.computer_use.computer_use_toolset"
+      title: "SSRF-Safe Outbound HTTP Client & IDNA/Punycode Guard"
+      security_invariant: "All outbound HTTP requests must validate resolved IPs against 169.254.169.254, loopback, RFC1918, NAT64, and 6to4 ranges, enforce IDNA ASCII domain allowlists, and validate redirects per hop."
+      recommended_fix: "Constrain ComputerUseToolset navigation with a page.route allowlist and validate outbound URLs with an allowlist (for example a validate_egress_url() helper)."
+    pattern: ComputerUseToolset(...)
+
+  - id: adk-a2a-push-notification-no-url-validator
+    message: >-
+      [L3-04 | Layer 3 | adk-core] A2A push notifications are sent to
+      client-supplied webhook URLs without `push_url_validator` (and forward
+      client-configured `Authorization` headers), enabling Server-Side Request
+      Forgery (SSRF) against loopback, RFC1918, and cloud metadata endpoints.
+      Pass `push_url_validator=validate_push_notification_url` (from
+      `a2a.utils.push_url_validator` in `a2a-sdk >= 1.1.4`) to
+      `DefaultRequestHandler`, `DefaultRequestHandlerV2`, `LegacyRequestHandler`,
+      or `BasePushNotificationSender`.
+    severity: ERROR
+    languages: [python]
+    metadata:
+      control_id: L3-04
+      rule_pack: adk-core
+      layer: "Layer 3: Tool, Data Connector & Network Safety"
+      module: "a2a.utils.push_url_validator"
+      category: security
+      cwe: "CWE-918: Server-Side Request Forgery (SSRF)"
+      owasp_agentic: "ASI02: Tool Misuse & Exploitation"
+      owasp_llm: "LLM06:2025 Excessive Agency"
+      severity_tier: "CRITICAL"
+      owasp_asi: "ASI02"
+      core_module: "a2a.utils.push_url_validator"
+      title: "A2A Push-Notification Webhook SSRF Validation"
+      security_invariant: "A2A push-notification senders and request handlers must enforce validate_push_notification_url on client-supplied webhook URLs and never use unvalidated InMemoryPushNotifier."
+      recommended_fix: "Pass push_url_validator=validate_push_notification_url (from a2a.utils.push_url_validator in a2a-sdk >= 1.1.4) to BasePushNotificationSender, DefaultRequestHandler, DefaultRequestHandlerV2, or LegacyRequestHandler, and replace InMemoryPushNotifier."
+    pattern-either:
+      - pattern: InMemoryPushNotifier(...)
+      - pattern: $M.InMemoryPushNotifier(...)
+      - pattern: BasePushNotificationSender(..., push_url_validator=None, ...)
+      - pattern: $M.BasePushNotificationSender(..., push_url_validator=None, ...)
+      - patterns:
+          - pattern-either:
+              - pattern: DefaultRequestHandler(..., push_sender=$PS, push_url_validator=None, ...)
+              - pattern: $HM.DefaultRequestHandler(..., push_sender=$PS, push_url_validator=None, ...)
+              - pattern: DefaultRequestHandlerV2(..., push_sender=$PS, push_url_validator=None, ...)
+              - pattern: $HM.DefaultRequestHandlerV2(..., push_sender=$PS, push_url_validator=None, ...)
+              - pattern: LegacyRequestHandler(..., push_sender=$PS, push_url_validator=None, ...)
+              - pattern: $HM.LegacyRequestHandler(..., push_sender=$PS, push_url_validator=None, ...)
+          - metavariable-regex:
+              metavariable: $PS
+              regex: '^(?!None$).+'
+      - patterns:
+          - pattern-either:
+              - pattern: BasePushNotificationSender(...)
+              - pattern: $M.BasePushNotificationSender(...)
+          - pattern-not: BasePushNotificationSender(..., push_url_validator=$V, ...)
+          - pattern-not: $M.BasePushNotificationSender(..., push_url_validator=$V, ...)
+          - pattern-not-inside:
+              patterns:
+                - pattern-either:
+                    - pattern: DefaultRequestHandler(..., push_sender=..., push_url_validator=$HV, ...)
+                    - pattern: $HM.DefaultRequestHandler(..., push_sender=..., push_url_validator=$HV, ...)
+                    - pattern: DefaultRequestHandlerV2(..., push_sender=..., push_url_validator=$HV, ...)
+                    - pattern: $HM.DefaultRequestHandlerV2(..., push_sender=..., push_url_validator=$HV, ...)
+                    - pattern: LegacyRequestHandler(..., push_sender=..., push_url_validator=$HV, ...)
+                    - pattern: $HM.LegacyRequestHandler(..., push_sender=..., push_url_validator=$HV, ...)
+                - metavariable-regex:
+                    metavariable: $HV
+                    regex: '^(?!None$).+'
+          - pattern-not-inside:
+              patterns:
+                - pattern-either:
+                    - pattern: |
+                        $S = $SENDER(...)
+                        ...
+                        <... DefaultRequestHandler(..., push_sender=$S, push_url_validator=$HV, ...) ...>
+                    - pattern: |
+                        $S = $SENDER(...)
+                        ...
+                        <... $HM.DefaultRequestHandler(..., push_sender=$S, push_url_validator=$HV, ...) ...>
+                    - pattern: |
+                        $S = $SENDER(...)
+                        ...
+                        <... DefaultRequestHandlerV2(..., push_sender=$S, push_url_validator=$HV, ...) ...>
+                    - pattern: |
+                        $S = $SENDER(...)
+                        ...
+                        <... $HM.DefaultRequestHandlerV2(..., push_sender=$S, push_url_validator=$HV, ...) ...>
+                    - pattern: |
+                        $S = $SENDER(...)
+                        ...
+                        <... LegacyRequestHandler(..., push_sender=$S, push_url_validator=$HV, ...) ...>
+                    - pattern: |
+                        $S = $SENDER(...)
+                        ...
+                        <... $HM.LegacyRequestHandler(..., push_sender=$S, push_url_validator=$HV, ...) ...>
+                - metavariable-regex:
+                    metavariable: $HV
+                    regex: '^(?!None$).+'
+
+  # ----------------------------------------------------------------------------
+  # L3-05: Layer 3 — Skill & Script Execution Guard (SkillToolset)
+  # ----------------------------------------------------------------------------
+  - id: adk-skill-unvalidated-script-execution
+    message: >-
+      [L3-05 | Layer 3 | adk-core] Detected `LocalEnvironment` or a
+      `SkillToolset` that runs skill scripts on the host. Host execution of
+      LLM-selected skill scripts inherits ambient credentials from
+      `os.environ` and grants remote code execution. Run skill scripts in a
+      sandboxed executor (`AgentEngineSandboxCodeExecutor`, `GkeCodeExecutor`),
+      keep `adk_inject_state` disabled, and review `allowed-tools` in SKILL.md.
+    severity: ERROR
+    languages: [python]
+    metadata:
+      control_id: L3-05
+      rule_pack: adk-core
+      layer: "Layer 3: Tool, Data Connector & Network Safety"
+      module: "google.adk"
+      category: security
+      cwe: "CWE-78: Improper Neutralization of Special Elements used in an OS Command"
+      owasp_agentic: "ASI05: Unexpected Code Execution (RCE)"
+      owasp_llm: "LLM06:2025 Excessive Agency"
+      severity_tier: "CRITICAL"
+      owasp_asi: "ASI05"
+      core_module: "google.adk.tools.skill_toolset"
+      title: "Skill & Script Execution Guard (SkillToolset)"
+      security_invariant: "Skill script execution must never use host LocalEnvironment, shell=True, raw LLM commands, or adk_inject_state: true frontmatter."
+      recommended_fix: "Run SkillToolset scripts in AgentEngineSandboxCodeExecutor or GkeCodeExecutor, never LocalEnvironment, and keep adk_inject_state disabled."
+    pattern-either:
+      - pattern: LocalEnvironment(...)
+      - pattern: SkillToolset(..., code_executor=LocalEnvironment(...), ...)
+      - pattern: SkillToolset(..., environment=LocalEnvironment(...), ...)
+      - pattern: SkillToolset(..., code_executor=None, ...)
+      - patterns:
+          - pattern: SkillToolset(...)
+          - pattern-not: SkillToolset(..., code_executor=$EXEC, ...)
+          - pattern-not: SkillToolset(..., environment=$ENV, ...)
+
+  # ----------------------------------------------------------------------------
+  # L4-01: Layer 4 — Sub-Agent Context Isolation & Privilege Uplift Prevention
+  # ----------------------------------------------------------------------------
+  - id: adk-subagent-full-context-inheritance
+    message: >-
+      [L4-01 | Layer 4 | adk-core] `LlmAgent` configured with `sub_agents=[...]`
+      whose children lack `include_contents="none"`. Full conversation
+      inheritance lets a prompt-injected sub-agent escalate privileges through
+      sibling or parent agents. Set `include_contents="none"`,
+      `disallow_transfer_to_peers=True`, and `disallow_transfer_to_parent=True`
+      on children, and validate child `state_delta` (for example with
+      a `validate_state_delta()` helper).
+    severity: WARNING
+    languages: [python]
+    metadata:
+      control_id: L4-01
+      rule_pack: adk-core
+      layer: "Layer 4: Sub-Agent, Sandbox & Artifact Isolation"
+      module: "google.adk"
+      category: security
+      cwe: "CWE-269: Improper Privilege Management"
+      owasp_agentic: "ASI03: Identity & Privilege Abuse"
+      owasp_llm: "LLM01:2025 Prompt Injection"
+      severity_tier: "HIGH"
+      owasp_asi: "ASI03/ASI07"
+      core_module: "google.adk.agents.LlmAgent"
+      title: "Sub-Agent Context Isolation & Privilege Uplift Prevention"
+      security_invariant: "Sub-agents must set include_contents='none' and disallow_transfer_to_peers=True, satisfy zero privilege uplift (Delta = C(s_n) \\ C(a) = empty set), and filter child state_delta."
+      recommended_fix: "Configure child LlmAgent(include_contents='none', disallow_transfer_to_peers=True) and filter child state_delta via validate_state_delta()."
+    patterns:
+      - pattern-either:
+          - pattern: LlmAgent(..., sub_agents=[..., LlmAgent(...), ...], ...)
+          - pattern: Agent(..., sub_agents=[..., Agent(...), ...], ...)
+      - pattern-not: LlmAgent(..., sub_agents=[..., LlmAgent(..., include_contents="none", ...), ...], ...)
+      - pattern-not: Agent(..., sub_agents=[..., Agent(..., include_contents="none", ...), ...], ...)
+
+  # ----------------------------------------------------------------------------
+  # L4-02: Layer 4 — Remote A2A Isolation & Cross-Agent History Scrubbing
+  # ----------------------------------------------------------------------------
+  - id: adk-a2a-unauthenticated-or-full-history
+    message: >-
+      [L4-02 | Layer 4 | adk-core] Detected `to_a2a(...)` server exposure, a
+      `RemoteA2aAgent` configured with `full_history_when_stateless=True`, or an
+      `A2aRemoteAgentConfig(forward_session_id_as_context_id=True)`. Serve `to_a2a`
+      apps only behind authenticated ingress (OIDC or mTLS), use HTTPS agent cards,
+      keep `full_history_when_stateless` at its `False` default, and forward session
+      IDs only as `"namespaced"` (or not at all).
+    severity: ERROR
+    languages: [python]
+    metadata:
+      control_id: L4-02
+      rule_pack: adk-core
+      layer: "Layer 4: Sub-Agent, Sandbox & Artifact Isolation"
+      module: "google.adk"
+      category: security
+      cwe: "CWE-200: Exposure of Sensitive Information to an Unauthorized Actor"
+      owasp_agentic: "ASI06: Sensitive Information & Credential Leakage"
+      owasp_llm: "LLM02:2025 Sensitive Information Disclosure"
+      severity_tier: "HIGH"
+      owasp_asi: "ASI07"
+      core_module: "google.adk.agents.remote_a2a_agent.RemoteA2aAgent"
+      title: "Remote A2A Isolation & Outbound Metadata Scrubbing"
+      security_invariant: "RemoteA2aAgent must keep full_history_when_stateless=False, use HTTPS agent cards, call authenticated A2A endpoints, and never forward raw local session IDs."
+      recommended_fix: "Keep RemoteA2aAgent(full_history_when_stateless=False) with an HTTPS agent card, pass config=A2aRemoteAgentConfig(forward_session_id_as_context_id=False or \"namespaced\"), and serve to_a2a() apps behind OIDC or mTLS."
+    pattern-either:
+      - pattern: to_a2a(...)
+      - pattern: RemoteA2aAgent(..., full_history_when_stateless=True, ...)
+      - pattern: A2aRemoteAgentConfig(..., forward_session_id_as_context_id=True, ...)
+      - pattern: $MOD.A2aRemoteAgentConfig(..., forward_session_id_as_context_id=True, ...)
+
+  # ----------------------------------------------------------------------------
+  # L4-03: Layer 4 — Ephemeral Sandboxed Code Execution
+  # (eval/exec/shell=True/deserialization in custom code: general SAST)
+  # ----------------------------------------------------------------------------
+  - id: adk-sandbox-unsafe-code-executor
+    message: >-
+      [L4-03 | Layer 4 | adk-core] Detected an ADK code executor that runs
+      model-generated code on the host or in an unhardened container
+      (`UnsafeLocalCodeExecutor`, `ContainerCodeExecutor`). This grants remote
+      code execution. Use `AgentEngineSandboxCodeExecutor` or `GkeCodeExecutor`
+      with a gVisor runtime class. `eval`/`exec`, `shell=True`, and unsafe
+      deserialization in custom code are out of scope for this ruleset.
+    severity: ERROR
+    languages: [python]
+    metadata:
+      control_id: L4-03
+      rule_pack: adk-core
+      layer: "Layer 4: Sub-Agent, Sandbox & Artifact Isolation"
+      module: "AgentEngineSandboxCodeExecutor"
+      category: security
+      cwe: "CWE-94: Improper Control of Generation of Code"
+      owasp_agentic: "ASI05: Unexpected Code Execution (RCE)"
+      owasp_llm: "LLM06:2025 Excessive Agency"
+      severity_tier: "CRITICAL"
+      owasp_asi: "ASI05"
+      core_module: "google.adk.code_executors.AgentEngineSandboxCodeExecutor"
+      title: "Ephemeral Sandboxed Code Execution & Deserialization Ban"
+      security_invariant: "Model-generated code must never run in UnsafeLocalCodeExecutor or an unhardened ContainerCodeExecutor; sandboxes must be ephemeral microVMs or gVisor pods."
+      recommended_fix: "Use native AgentEngineSandboxCodeExecutor or GkeCodeExecutor (with gVisor runtimeClassName='gvisor')."
+    pattern-either:
+      - pattern: UnsafeLocalCodeExecutor(...)
+      - pattern: ContainerCodeExecutor(...)
+
+  # ----------------------------------------------------------------------------
+  # L4-04: Layer 4 — Artifact Upload Validation & Path Traversal Guard
+  # (GCS bucket/blob checks: optional gcp-gemini pack; open() traversal: general SAST)
+  # ----------------------------------------------------------------------------
+  - id: adk-artifact-unvalidated-upload-path
+    message: >-
+      [L4-04 | Layer 4 | adk-core] `SaveFilesAsArtifactsPlugin` persists user
+      uploads, or `save_artifact()` is called with a filename taken directly
+      from a function parameter. Unvalidated artifact names allow `../`
+      traversal and `user:` / `app:` scope-prefix injection. Sanitize the name
+      with `os.path.basename()`, reject scope prefixes, and enforce MIME,
+      magic-byte, and size allowlists before saving.
+    severity: WARNING
+    languages: [python]
+    metadata:
+      control_id: L4-04
+      rule_pack: adk-core
+      layer: "Layer 4: Sub-Agent, Sandbox & Artifact Isolation"
+      module: "google.adk"
+      category: security
+      cwe: "CWE-22: Improper Limitation of a Pathname to a Restricted Directory"
+      owasp_agentic: "ASI02: Tool Misuse & Exploitation"
+      owasp_llm: "LLM01:2025 Prompt Injection"
+      severity_tier: "HIGH"
+      owasp_asi: "ASI02"
+      core_module: "google.adk.plugins.save_files_as_artifacts_plugin"
+      title: "Artifact Upload Magic-Byte Validation & Path Traversal Guard"
+      security_invariant: "Artifact filenames must be sanitized against '../' traversal and 'user:'/'app:' scope prefixes, and verified against MIME and magic-byte allowlists."
+      recommended_fix: "Sanitize artifact names with os.path.basename(), reject 'user:'/'app:' prefixes, and check MIME type, magic bytes, and size before save_artifact()."
+    pattern-either:
+      - pattern: SaveFilesAsArtifactsPlugin(...)
+      - patterns:
+          - pattern-inside: |
+              def $FUNC(..., $NAME, ...):
+                  ...
+          - pattern-either:
+              - pattern: $CTX.save_artifact($NAME, ...)
+              - pattern: $CTX.save_artifact(filename=$NAME, ...)
+
+  # ----------------------------------------------------------------------------
+  # L4-05: Layer 4 — Fail-Closed Multi-Tenant RAG Memory & Scope Isolation
+  # ----------------------------------------------------------------------------
+  - id: adk-memory-unscoped-rag-corpus
+    message: >-
+      [L4-05 | Layer 4 | adk-core] Detected `VertexAiRagMemoryService(...)`.
+      When a shared RAG corpus exceeds 1,000 files, ADK silently drops the
+      per-user `rag_resources` filter and `retrieval_query` searches the entire
+      multi-tenant corpus. Use one corpus per tenant, or verify the filter is
+      applied and fail closed when it cannot be.
+    severity: WARNING
+    languages: [python]
+    metadata:
+      control_id: L4-05
+      rule_pack: adk-core
+      layer: "Layer 4: Sub-Agent, Sandbox & Artifact Isolation"
+      module: "google.adk"
+      category: security
+      cwe: "CWE-668: Exposure of Resource to Wrong Sphere"
+      owasp_agentic: "ASI06: Sensitive Information & Credential Leakage"
+      owasp_llm: "LLM02:2025 Sensitive Information Disclosure"
+      severity_tier: "HIGH"
+      owasp_asi: "ASI06"
+      core_module: "google.adk.memory.vertex_ai_rag_memory_service"
+      title: "Fail-Closed Multi-Tenant RAG Memory & Scope Isolation"
+      security_invariant: "VertexAiRagMemoryService queries must enforce tenant/user scoping and fail closed above the 1,000-file RAG filter ceiling."
+      recommended_fix: "Provision one RAG corpus per tenant for VertexAiRagMemoryService, or verify per-user filtering is applied and fail closed when the corpus exceeds 1,000 files."
+    pattern: VertexAiRagMemoryService(...)
+
+  # ----------------------------------------------------------------------------
+  # L5-01: Layer 5 — Bounded Reasoning Turns, Token Budget & Loop Breaker
+  # ----------------------------------------------------------------------------
+  - id: adk-budget-unbounded-llm-calls
+    message: >-
+      [L5-01 | Layer 5 | adk-core] Detected `RunConfig` with `max_llm_calls=0`
+      or `max_llm_calls=-1`, `ReflectAndRetryToolPlugin(tracking_scope=TrackingScope.GLOBAL)`,
+      or `LoopAgent` without `max_iterations`. Set a strict positive bound
+      (`RunConfig(max_llm_calls=20)`, `LoopAgent(max_iterations=5)`) and
+      `ReflectAndRetryToolPlugin(max_retries=2, tracking_scope=TrackingScope.INVOCATION)`.
+    severity: ERROR
+    languages: [python]
+    metadata:
+      control_id: L5-01
+      rule_pack: adk-core
+      layer: "Layer 5: Resilience, Telemetry & Secure Delivery Gates"
+      module: "google.adk"
+      category: security
+      cwe: "CWE-400: Uncontrolled Resource Consumption"
+      owasp_agentic: "ASI08: Cascading Failures & Resource Exhaustion"
+      owasp_llm: "LLM10:2025 Unbounded Consumption"
+      severity_tier: "MEDIUM"
+      owasp_asi: "ASI08"
+      core_module: "google.adk.plugins.ReflectAndRetryToolPlugin"
+      title: "Bounded Reasoning Turns, Token Budget & Loop Circuit Breaker"
+      security_invariant: "RunConfig must specify 1 <= max_llm_calls <= 50 and retry plugins must use TrackingScope.INVOCATION with session token & loop caps."
+      recommended_fix: "Configure RunConfig(max_llm_calls=20) and ReflectAndRetryToolPlugin(tracking_scope=TrackingScope.INVOCATION)."
+    pattern-either:
+      - pattern: RunConfig(..., max_llm_calls=0, ...)
+      - pattern: RunConfig(..., max_llm_calls=-1, ...)
+      - pattern: types.RunConfig(..., max_llm_calls=0, ...)
+      - pattern: types.RunConfig(..., max_llm_calls=-1, ...)
+      - pattern: ReflectAndRetryToolPlugin(..., tracking_scope=TrackingScope.GLOBAL, ...)
+      - patterns:
+          - pattern: LoopAgent(...)
+          - pattern-not: LoopAgent(..., max_iterations=..., ...)
+
+  # ----------------------------------------------------------------------------
+  # L5-02: Layer 5 — Sensitive Telemetry & Span Lockdown
+  # (secrets written to application logs: general SAST)
+  # ----------------------------------------------------------------------------
+  - id: adk-telemetry-unredacted-spans-or-logs
+    message: >-
+      [L5-02 | Layer 5 | adk-core] Detected `LoggingPlugin()`,
+      `DebugLoggingPlugin()`, or `ADK_CAPTURE_MESSAGE_CONTENT_IN_SPANS="true"`.
+      These export raw prompts, tool arguments, tokens, and PII to logs and
+      telemetry spans. Keep `ADK_CAPTURE_MESSAGE_CONTENT_IN_SPANS="false"`, do
+      not register the logging plugins in production, and attach a redacting
+      `logging.Filter`.
+    severity: ERROR
+    languages: [python]
+    metadata:
+      control_id: L5-02
+      rule_pack: adk-core
+      layer: "Layer 5: Resilience, Telemetry & Secure Delivery Gates"
+      module: "google.adk"
+      category: security
+      cwe: "CWE-532: Insertion of Sensitive Information into Log File"
+      owasp_agentic: "ASI06: Sensitive Information & Credential Leakage"
+      owasp_llm: "LLM02:2025 Sensitive Information Disclosure"
+      severity_tier: "HIGH"
+      owasp_asi: "ASI10"
+      core_module: "google.adk"
+      title: "Sensitive Telemetry Lockdown & PII/Credential Log Redaction"
+      security_invariant: "ADK_CAPTURE_MESSAGE_CONTENT_IN_SPANS must be 'false', LoggingPlugin/DebugLoggingPlugin must not be used in production, and logs must redact bearer tokens, API keys, and raw prompts."
+      recommended_fix: "Set ADK_CAPTURE_MESSAGE_CONTENT_IN_SPANS='false', remove LoggingPlugin/DebugLoggingPlugin from production apps, and attach a redacting logging.Filter."
+    pattern-either:
+      - pattern: LoggingPlugin(...)
+      - pattern: DebugLoggingPlugin(...)
+      - pattern: os.environ["ADK_CAPTURE_MESSAGE_CONTENT_IN_SPANS"] = "true"
+      - pattern: os.environ["ADK_CAPTURE_MESSAGE_CONTENT_IN_SPANS"] = "True"
+
+  # ----------------------------------------------------------------------------
+  # L5-03: Layer 5 — Agent Config YAML & Service Registry Code-Execution Lock
+  # (yaml.load / yaml.unsafe_load in custom code: general SAST)
+  # ----------------------------------------------------------------------------
+  - id: adk-config-unsafe-yaml-or-service-registry
+    message: >-
+      [L5-03 | Layer 5 | adk-core] Detected `_ENFORCE_YAML_KEY_DENYLIST = False`
+      or a dynamic ADK service registration (`register_memory_service`,
+      `register_session_service`, `register_artifact_service`). Disabling the
+      agent-config key denylist or registering service factories from
+      untrusted configuration lets declarative YAML import arbitrary modules.
+      Keep `_ENFORCE_YAML_KEY_DENYLIST = True` and register only allowlisted
+      service URIs.
+    severity: ERROR
+    languages: [python]
+    metadata:
+      control_id: L5-03
+      rule_pack: adk-core
+      layer: "Layer 5: Resilience, Telemetry & Secure Delivery Gates"
+      module: "google.adk.agents.config_agent_utils"
+      category: security
+      cwe: "CWE-502: Deserialization of Untrusted Data"
+      owasp_agentic: "ASI05: Unexpected Code Execution (RCE)"
+      owasp_llm: "LLM06:2025 Excessive Agency"
+      severity_tier: "CRITICAL"
+      owasp_asi: "ASI04/ASI05"
+      core_module: "google.adk.agents.config_agent_utils"
+      title: "Agent Config YAML & Service Registry Code-Execution Lock"
+      security_invariant: "_ENFORCE_YAML_KEY_DENYLIST must remain True, YAML parsing must use yaml.safe_load, and agent/service YAML configs must not reference unallowlisted class_path modules or arbitrary args."
+      recommended_fix: "Keep ADK _ENFORCE_YAML_KEY_DENYLIST=True, register only allowlisted service URIs, and restrict declarative agent configs to allowlisted tool modules."
+    pattern-either:
+      - pattern: _ENFORCE_YAML_KEY_DENYLIST = False
+      - pattern: get_service_registry().register_memory_service(...)
+      - pattern: get_service_registry().register_session_service(...)
+      - pattern: get_service_registry().register_artifact_service(...)
+      - pattern: $REG.register_memory_service(...)
+      - pattern: $REG.register_session_service(...)
+      - pattern: $REG.register_artifact_service(...)
+
+  - id: adk-config-runtime-agent-mutation
+    message: >-
+      [L5-03 | Layer 5 | adk-core] Function `$FUNC` mutates an ADK agent's
+      `tools`, `sub_agents`, or `instruction` dynamically at runtime. Mutating a
+      live agent definition after initialization enables runtime tool injection
+      and cross-request state contamination. Freeze agent toolsets and
+      sub-agents at startup and gate per-turn behavior via `InstructionProvider`
+      or `before_tool_callback`.
+    severity: ERROR
+    languages: [python]
+    metadata:
+      control_id: L5-03
+      rule_pack: adk-core
+      layer: "Layer 5: Resilience, Telemetry & Secure Delivery Gates"
+      module: "google.adk.agents.config_agent_utils"
+      category: security
+      cwe: "CWE-471: Modification of Assumed-Immutable Data (MAID)"
+      owasp_agentic: "ASI04: Supply Chain & Rug-Pull Vulnerabilities"
+      owasp_llm: "LLM06:2025 Excessive Agency"
+      severity_tier: "HIGH"
+      owasp_asi: "ASI04/ASI05"
+      core_module: "google.adk.agents"
+      title: "Immutable Post-Init ADK Agent Toolsets & Sub-Agents"
+      security_invariant: "ADK agent tools, sub_agents, and instruction attributes must not be mutated dynamically inside runtime callbacks or tools."
+      recommended_fix: "Declare agent tools and sub_agents statically at initialization and enforce dynamic authorization inside before_tool_callback rather than mutating agent.tools at runtime."
+    patterns:
+      - pattern-either:
+          - pattern-inside: |
+              import google.adk
+              ...
+          - pattern-inside: |
+              import google.adk.$SUB
+              ...
+          - pattern-inside: |
+              from google.adk import $IMP
+              ...
+          - pattern-inside: |
+              from google.adk.$SUB import $IMP
+              ...
+          - pattern-inside: |
+              from google.adk.$SUB.$SUB2 import $IMP
+              ...
+      - pattern-inside: |
+          def $FUNC(...):
+            ...
+      - metavariable-regex:
+          metavariable: $FUNC
+          regex: '^(?!__init__$|_?set_up$|(?:_)?(?:create|build|make|init|setup|construct|get)_).*'
+      - pattern-either:
+          - pattern: $AGENT.tools.append(...)
+          - pattern: $AGENT.tools.extend(...)
+          - pattern: $AGENT.tools.insert(...)
+          - pattern: $AGENT.sub_agents.append(...)
+          - pattern: $AGENT.sub_agents.extend(...)
+          - pattern: $AGENT.sub_agents.insert(...)
+          - pattern: $AGENT.instruction = $NEW_INSTR
+          - pattern: $AGENT.tools = $NEW_TOOLS
+          - pattern: $AGENT.sub_agents = $NEW_SUBAGENTS
+      - pattern-not-inside: |
+          def $FUNC(...):
+            ...
+            $AGENT = LlmAgent(...)
+            ...
+      - pattern-not-inside: |
+          def $FUNC(...):
+            ...
+            $AGENT = Agent(...)
+            ...
+
+  # ----------------------------------------------------------------------------
+  # L5-04: Layer 5 — Scoped Deployment Packaging
+  # (static keys, GOOGLE_APPLICATION_CREDENTIALS, env_vars secrets, Terraform
+  #  service-account keys: optional gcp-gemini pack; committed keys: secrets scanner)
+  # ----------------------------------------------------------------------------
+  - id: adk-deploy-static-sa-key-or-root-package
+    message: >-
+      [L5-04 | Layer 5 | adk-core] Agent deployment bundles the repository root
+      (`extra_packages=["."]`), shipping `.env` files, local credentials, and
+      tests into the deployed agent. Package only the agent directory
+      (`extra_packages=["./my_agent"]`). Static service-account key and
+      `env_vars` secret checks are in the optional gcp-gemini pack; scan for
+      committed key material with a secrets scanner.
+    severity: ERROR
+    languages: [python]
+    metadata:
+      control_id: L5-04
+      rule_pack: adk-core
+      layer: "Layer 5: Resilience, Telemetry & Secure Delivery Gates"
+      module: "google.adk.cli.cli_deploy"
+      category: security
+      cwe: "CWE-798: Use of Hard-coded Credentials"
+      owasp_agentic: "ASI03: Identity & Privilege Abuse"
+      owasp_llm: "LLM06:2025 Excessive Agency"
+      severity_tier: "CRITICAL"
+      owasp_asi: "ASI03/ASI04"
+      core_module: "google.adk.cli.cli_deploy"
+      title: "Keyless Workload Identity & Scoped Deployment Packaging"
+      security_invariant: "Deployments must never use static JSON service account keys (GOOGLE_APPLICATION_CREDENTIALS, google_service_account_key), hardcoded GOOGLE_API_KEY env vars, or root extra_packages=['.']."
+      recommended_fix: "Package only the agent directory (extra_packages=['./my_agent']) and use keyless Workload/Agent Identity with Secret Manager references."
+    patterns:
+      - pattern: $DEPLOY(..., extra_packages=[..., "$PKG", ...], ...)
+      - metavariable-regex:
+          metavariable: $PKG
+          regex: "^(\\.|\\./|)$"
+
+  # ----------------------------------------------------------------------------
+  # Declarative ADK YAML & Skill Markdown Config Rules (adk-core)
+  # ----------------------------------------------------------------------------
+  - id: adk-prompt-var-interpolation-yaml
+    message: >-
+      [L1-01 | Layer 1 | adk-core] Declarative ADK agent YAML `instruction`
+      contains an unescaped `{var}` or `{var?}` session-state placeholder. Escape
+      literal braces or move dynamic context into a Python `InstructionProvider`.
+    severity: ERROR
+    languages: [yaml]
+    paths:
+      exclude:
+        - "*cloudbuild*"
+        - ".github/**"
+        - ".pre-commit-config.yaml"
+        - "*semgrep*"
+    metadata:
+      control_id: L1-01
+      rule_pack: adk-core
+      layer: "Layer 1: Model, Prompt & Context Integrity"
+      module: "google.adk.utils.instructions_utils"
+      category: security
+      cwe: "CWE-77: Improper Neutralization of Special Elements used in a Command"
+      owasp_agentic: "ASI01: Agent Goal Hijack"
+      owasp_llm: "LLM01:2025 Prompt Injection"
+      severity_tier: "CRITICAL"
+      owasp_asi: "ASI01"
+      core_module: "google.adk.utils.instructions_utils"
+      title: "Safe Instruction Provider & Context Data Fencing"
+      security_invariant: "System instructions must be static strings without {var} placeholders or callable InstructionProvider functions; untrusted context must be XML-fenced."
+      recommended_fix: "Replace string instruction templates containing {var} with a callable InstructionProvider(ReadonlyContext) -> str."
+    patterns:
+      - pattern-either:
+          - pattern: |
+              ...
+              instruction: $INSTR
+              ...
+          - pattern: |
+              ...
+              global_instruction: $INSTR
+              ...
+          - pattern: |
+              ...
+              static_instruction: $INSTR
+              ...
+      - pattern-either:
+          - pattern: |
+              ...
+              model: $MODEL
+              ...
+          - pattern: |
+              ...
+              agent_class: $ACLS
+              ...
+          - pattern: |
+              ...
+              sub_agents: $SUBS
+              ...
+          - pattern: |
+              ...
+              tools: $TOOLS
+              ...
+      - metavariable-regex:
+          metavariable: $INSTR
+          regex: '(?s)^(?:```(?:(?!```)[\s\S])*```|`[^`\n]+`|\{\{[^}]*\}\}|`(?!``)(?![^`\n]*`)|[^{`])*?(?<!\{)\{[a-zA-Z_][a-zA-Z0-9_.:]*\??\}(?!\})'
+      - focus-metavariable: $INSTR
+
+  - id: adk-prompt-var-interpolation-skill-md
+    message: >-
+      [L1-01 | Layer 1 | adk-core] `SKILL.md` enables state/tool injection in
+      frontmatter (`adk_inject_state: true` or `allowed-tools` /
+      `adk_additional_tools`) and interpolates an unescaped `{var}` template
+      variable in the skill prompt body.
+    severity: ERROR
+    languages: [regex]
+    paths:
+      include:
+        - "SKILL.md"
+        - "**/SKILL.md"
+    metadata:
+      control_id: L1-01
+      rule_pack: adk-core
+      layer: "Layer 1: Model, Prompt & Context Integrity"
+      module: "google.adk.utils.instructions_utils"
+      category: security
+      cwe: "CWE-77: Improper Neutralization of Special Elements used in a Command"
+      owasp_agentic: "ASI01: Agent Goal Hijack"
+      owasp_llm: "LLM01:2025 Prompt Injection"
+      severity_tier: "CRITICAL"
+      owasp_asi: "ASI01"
+      core_module: "google.adk.utils.instructions_utils"
+      title: "Safe Instruction Provider & Context Data Fencing"
+      security_invariant: "System instructions must be static strings without {var} placeholders or callable InstructionProvider functions; untrusted context must be XML-fenced."
+      recommended_fix: "Remove adk_inject_state: true or escape {var} placeholders in SKILL.md prompt bodies."
+    pattern-regex: '(?ms)\A---\r?\n(?:(?!^(?:---|\.\.\.)\s*$)[\s\S])*?(?:\badk_inject_state\s*:\s*(?:true|yes|1)\b|^[ \t]*(?:allowed-tools|adk_additional_tools)\s*:)[\s\S]*?^(?:---|\.\.\.)[ \t]*\r?\n(?:```(?:(?!```)[\s\S])*```|`[^`\n]+`|\$\$(?:(?!\$\$)[\s\S])*\$\$|\$[^$\n]+\$|\\[a-zA-Z]+(?:\{[^{}]*\})+|\{\{[^}]*\}\}|[^{`\\$]|\\(?![a-zA-Z]+\{).)*?(?<![a-zA-Z0-9_\\{`$])\{[a-zA-Z_][a-zA-Z0-9_.:]*\??\}(?![}`$])'
+
+  - id: adk-skill-unvalidated-script-execution-config
+    message: >-
+      [L3-05 | Layer 3 | adk-core] Skill or agent configuration enables
+      `adk_inject_state: true` or declares `allowed-tools` /
+      `adk_additional_tools` in frontmatter without host allowlist validation.
+    severity: ERROR
+    languages: [regex]
+    paths:
+      include:
+        - "SKILL.md"
+        - "**/SKILL.md"
+        - "*.yaml"
+        - "*.yml"
+        - "*.json"
+        - ".*.yaml"
+        - ".*.yml"
+        - ".*.json"
+      exclude:
+        - "*semgrep*"
+        - ".pre-commit-config.yaml"
+        - "*cloudbuild*"
+        - ".github/**"
+    metadata:
+      control_id: L3-05
+      rule_pack: adk-core
+      layer: "Layer 3: Tool, Connector & Egress Controls"
+      module: "google.adk.tools.skill_toolset"
+      category: security
+      cwe: "CWE-94: Improper Control of Generation of Code"
+      owasp_agentic: "ASI05: Unexpected Code Execution (RCE)"
+      owasp_llm: "LLM06:2025 Excessive Agency"
+      severity_tier: "HIGH"
+      owasp_asi: "ASI04/ASI05"
+      core_module: "google.adk.tools.skill_toolset"
+      title: "Skill Script Sandboxing, Frontmatter Sanitization & State Injection Ban"
+      security_invariant: "SkillToolset script execution must run inside AgentEngineSandboxCodeExecutor (never LocalEnvironment), enforce script allowlists, and forbid adk_inject_state: true."
+      recommended_fix: "Keep adk_inject_state: false and enforce host-side tool allowlists instead of frontmatter allowed-tools or adk_additional_tools."
+    pattern-regex: '(?mi)\A(?:---\r?\n(?:(?!^---\s*$|^\.\.\.\s*$)[\s\S])*?^[ \t]*(?:adk_inject_state[ \t]*:[ \t]*(?:true|yes|1)\b|(?:allowed-tools|adk_additional_tools)[ \t]*:)|(?!--+\r?\n)[\s\S]*?^[ \t]*"?adk_inject_state"?[ \t]*:[ \t]*"?(?:true|yes|1)\b)'
+
+  - id: adk-subagent-workflow-unbounded-yaml
+    message: >-
+      [L4-01 | Layer 4 | adk-core] Declarative `agent_class: Workflow` defines
+      `edges:` without a `max_iterations` bound. Configure explicit
+      `max_iterations` and sub-agent context isolation.
+    severity: WARNING
+    languages: [yaml]
+    paths:
+      exclude:
+        - "*cloudbuild*"
+        - ".github/**"
+        - "*semgrep*"
+    metadata:
+      control_id: L4-01
+      rule_pack: adk-core
+      layer: "Layer 4: Sub-Agent, Sandbox & Artifact Isolation"
+      module: "google.adk"
+      category: security
+      cwe: "CWE-269: Improper Privilege Management"
+      owasp_agentic: "ASI07: Insecure Inter-Agent Communication"
+      owasp_llm: "LLM06:2025 Excessive Agency"
+      severity_tier: "HIGH"
+      owasp_asi: "ASI07"
+      core_module: "google.adk"
+      title: "Sub-Agent Context Isolation & Filtered State Handoff"
+      security_invariant: "Sub-agents handling untrusted data must set include_contents='none', disallow peer/parent transfer, and bound cyclic Workflow edges with max_iterations."
+      recommended_fix: "Add an explicit positive max_iterations bound on declarative Workflow configurations with edges."
+    patterns:
+      - pattern: |
+          ...
+          agent_class: $CLS
+          ...
+      - pattern: |
+          ...
+          edges: $EDGES
+          ...
+      - pattern-not: |
+          ...
+          max_iterations: $MAX
+          ...
+      - metavariable-regex:
+          metavariable: $CLS
+          regex: '^["'']?(?:google\.adk\.workflows\.)?Workflow["'']?$'
+      - focus-metavariable: $CLS
+
+  - id: adk-sandbox-unsafe-code-executor-yaml
+    message: >-
+      [L4-03 | Layer 4 | adk-core] Declarative agent YAML specifies
+      `UnsafeLocalCodeExecutor`, `BuiltInCodeExecutor`, or
+      `ContainerCodeExecutor`. Use `AgentEngineSandboxCodeExecutor` or
+      `GkeCodeExecutor` instead.
+    severity: ERROR
+    languages: [yaml]
+    paths:
+      exclude:
+        - "*semgrep*"
+        - "*cloudbuild*"
+        - ".github/**"
+    metadata:
+      control_id: L4-03
+      rule_pack: adk-core
+      layer: "Layer 4: Sub-Agent, Sandbox & Artifact Isolation"
+      module: "google.adk.code_executors.agent_engine_sandbox_code_executor"
+      category: security
+      cwe: "CWE-250: Execution with Unnecessary Privileges"
+      owasp_agentic: "ASI05: Unexpected Code Execution (RCE)"
+      owasp_llm: "LLM06:2025 Excessive Agency"
+      severity_tier: "CRITICAL"
+      owasp_asi: "ASI05"
+      core_module: "google.adk.code_executors.agent_engine_sandbox_code_executor"
+      title: "Isolated Sandbox Code Execution (Zero Host Execution)"
+      security_invariant: "Agent code execution must use AgentEngineSandboxCodeExecutor or GkeCodeExecutor; UnsafeLocalCodeExecutor and ContainerCodeExecutor are prohibited."
+      recommended_fix: "Replace UnsafeLocalCodeExecutor, BuiltInCodeExecutor, or ContainerCodeExecutor in declarative YAML with AgentEngineSandboxCodeExecutor or GkeCodeExecutor."
+    patterns:
+      - pattern: |
+          $KEY: $EXEC
+      - metavariable-regex:
+          metavariable: $EXEC
+          regex: '^["'']?(?:[\w.]+\.)?(?:UnsafeLocalCodeExecutor|BuiltInCodeExecutor|ContainerCodeExecutor)["'']?$'
+
+  - id: adk-budget-unbounded-loop-agent-yaml
+    message: >-
+      [L5-01 | Layer 5 | adk-core] Declarative `agent_class: LoopAgent` omits
+      `max_iterations`, enabling unbounded reasoning loops. Set an explicit
+      positive `max_iterations` bound (for example `max_iterations: 5`).
+    severity: ERROR
+    languages: [yaml]
+    paths:
+      exclude:
+        - "*cloudbuild*"
+        - ".github/**"
+        - "*semgrep*"
+    metadata:
+      control_id: L5-01
+      rule_pack: adk-core
+      layer: "Layer 5: Resilience, Telemetry & Secure Delivery Gates"
+      module: "google.adk.plugins.ReflectAndRetryToolPlugin"
+      category: security
+      cwe: "CWE-400: Uncontrolled Resource Consumption"
+      owasp_agentic: "ASI08: Cascading Failures & Resource Exhaustion"
+      owasp_llm: "LLM10:2025 Unbounded Consumption"
+      severity_tier: "MEDIUM"
+      owasp_asi: "ASI08"
+      core_module: "google.adk.plugins.ReflectAndRetryToolPlugin"
+      title: "Bounded Reasoning Turns, Token Budget & Loop Circuit Breaker"
+      security_invariant: "RunConfig must specify 1 <= max_llm_calls <= 50 and LoopAgent configurations must specify a positive max_iterations bound."
+      recommended_fix: "Add a strict positive max_iterations bound (for example max_iterations: 5) to declarative LoopAgent YAML files."
+    patterns:
+      - pattern: |
+          ...
+          agent_class: $CLS
+          ...
+      - pattern-not: |
+          ...
+          max_iterations: $MAX
+          ...
+      - metavariable-regex:
+          metavariable: $CLS
+          regex: '^["'']?(?:google\.adk\.agents\.)?LoopAgent["'']?$'
+      - focus-metavariable: $CLS
+
+  - id: adk-config-unsafe-yaml-callable
+    message: >-
+      [L5-03 | Layer 5 | adk-core] Declarative agent or service YAML references
+      an unallowlisted dynamic module/callable path (`class_path`, `agent_class`,
+      `class`, or dotted `tools` entry) or `additional_tools` without host
+      allowlist verification.
+    severity: ERROR
+    languages: [yaml]
+    paths:
+      exclude:
+        - "*cloudbuild*"
+        - ".github/**"
+        - ".pre-commit-config.yaml"
+        - "*semgrep*"
+        - "*docker-compose*"
+    metadata:
+      control_id: L5-03
+      rule_pack: adk-core
+      layer: "Layer 5: Resilience, Telemetry & Secure Delivery Gates"
+      module: "google.adk.agents.config_agent_utils"
+      category: security
+      cwe: "CWE-502: Deserialization of Untrusted Data"
+      owasp_agentic: "ASI05: Unexpected Code Execution (RCE)"
+      owasp_llm: "LLM06:2025 Excessive Agency"
+      severity_tier: "CRITICAL"
+      owasp_asi: "ASI04/ASI05"
+      core_module: "google.adk.agents.config_agent_utils"
+      title: "Agent Config YAML & Service Registry Code-Execution Lock"
+      security_invariant: "_ENFORCE_YAML_KEY_DENYLIST must remain True, YAML parsing must use yaml.safe_load, and agent/service YAML configs must not reference unallowlisted class_path modules or arbitrary args."
+      recommended_fix: "Keep ADK _ENFORCE_YAML_KEY_DENYLIST=True, register only allowlisted service URIs, and restrict declarative agent configs to allowlisted tool modules."
+    pattern-either:
+      - patterns:
+          - pattern-either:
+              - pattern: |
+                  class_path: $CP
+              - pattern: |
+                  agent_class: $CP
+              - patterns:
+                  - pattern: |
+                      class: $CP
+                  - pattern-either:
+                      - pattern-inside: |
+                          ...
+                          services: $SVCS
+                          ...
+                      - pattern-inside: |
+                          ...
+                          code_executor:
+                            ...
+                          ...
+                      - pattern-inside: |
+                          ...
+                          model: $MODEL
+                          ...
+                      - pattern-inside: |
+                          ...
+                          agent_class: $ACLS
+                          ...
+          - metavariable-regex:
+              metavariable: $CP
+              regex: '^["'']?(?!google\.adk\.)(?![a-zA-Z0-9_.]*\.core(?:\.|["'']?$))[a-zA-Z_][a-zA-Z0-9_]*\.[a-zA-Z_][a-zA-Z0-9_.]*["'']?$'
+          - metavariable-regex:
+              metavariable: $CP
+              regex: '^(?!.*\.(?:yaml|yml|json|md|py|txt|sh)["'']?$)'
+      - patterns:
+          - pattern-either:
+              - pattern-inside: |
+                  ...
+                  model: $MODEL
+                  ...
+              - pattern-inside: |
+                  ...
+                  agent_class: $ACLS
+                  ...
+              - pattern-inside: |
+                  ...
+                  instruction: $INSTR
+                  ...
+          - pattern-inside: |
+              ...
+              tools:
+                ...
+              ...
+          - pattern: |
+              name: $CP
+          - metavariable-regex:
+              metavariable: $CP
+              regex: '^["'']?(?!google\.adk\.)(?![a-zA-Z0-9_.]*\.core(?:\.|["'']?$))[a-zA-Z_][a-zA-Z0-9_]*\.[a-zA-Z_][a-zA-Z0-9_.]*["'']?$'
+          - metavariable-regex:
+              metavariable: $CP
+              regex: '^(?!.*\.(?:yaml|yml|json|md|py|txt|sh)["'']?$)'
+      - pattern: |
+          additional_tools: $ANY
+      - pattern: |
+          adk_additional_tools: $ANY
+
+  # ----------------------------------------------------------------------------
+  # ADK CLI, Container & Deployment Configuration Rules (adk-core)
+  # ----------------------------------------------------------------------------
+  - id: adk-server-wildcard-cors-origin-cli
+    message: >-
+      [L2-03 | Layer 2 | adk-core] `adk web` or `adk api_server` is invoked with
+      `--allow_origins "*"`, which disables ADK's Origin check and DNS-rebinding
+      protection and reflects arbitrary browser origins with credentials enabled.
+      Pass explicit allowed origins instead of `"*"`.
+    severity: ERROR
+    languages: [regex]
+    paths:
+      include:
+        - "Dockerfile"
+        - "*Dockerfile*"
+        - "*.dockerfile"
+        - "Procfile"
+        - "*.sh"
+        - "*.bash"
+        - "Makefile"
+        - "*.mk"
+        - "*.yaml"
+        - "*.yml"
+        - ".*.yaml"
+        - ".*.yml"
+        - "*.toml"
+        - "*.ps1"
+        - "*.py"
+        - "justfile"
+        - "Taskfile*"
+        - ".env"
+        - ".env.*"
+        - "*.env"
+        - "*.tf"
+        - "*.tfvars"
+        - "*.ini"
+        - "*.cfg"
+        - "*.conf"
+      exclude:
+        - "_site"
+        - "_site/**"
+        - ".github"
+        - ".github/**"
+        - ".pre-commit-config.yaml"
+        - "*adk-security-rules.yaml"
+    metadata:
+      control_id: L2-03
+      rule_pack: adk-core
+      layer: "Layer 2: Identity, Auth & Least-Privilege IAM"
+      module: "google.adk.cli"
+      category: security
+      cwe: "CWE-346: Origin Validation Error"
+      owasp_agentic: "ASI03: Identity & Privilege Abuse"
+      owasp_llm: "LLM06:2025 Excessive Agency"
+      severity_tier: "CRITICAL"
+      owasp_asi: "ASI03"
+      core_module: "google.adk.cli"
+      title: "Wildcard CORS Origin on ADK CLI Server"
+      security_invariant: "ADK CLI servers (adk web and adk api_server) must never pass wildcard '*' to --allow_origins."
+      recommended_fix: "Replace --allow_origins='*' with an explicit HTTPS origin allowlist (for example --allow_origins=https://portal.example.com)."
+    pattern-regex: '(?m)^(?![ \t]*(?:#|//))(?:(?![ \t]#)[^\n])*?\badk[\s"'',]+(?:web|api_server)\b(?:(?![ \t]#)[^\n]|\\\r?\n(?![ \t]*#))*?--allow_origins(?:[=\s]+|["'']\s*,\s*(?=["'']))(?:["''](?:[^"''\n]*,\s*)?\*(?:\s*,[^"''\n]*)?["'']|(?:[^\s"''#\\,]+,)*\*(?=[,\s"''#\\]|$))'
+
+  - id: adk-dev-ui-container-entrypoint
+    message: >-
+      [L2-03 | Layer 2 | adk-core] `adk web` (the ADK development UI server,
+      which exposes debug trace, session, and builder routes with no built-in
+      authentication) is used as a container or deployment entrypoint. Serve an
+      application built with `get_fast_api_app(web=False)` or `adk api_server`
+      behind authenticated ingress instead.
+    severity: WARNING
+    languages: [regex]
+    paths:
+      include:
+        - "Dockerfile"
+        - "*Dockerfile*"
+        - "*.dockerfile"
+        - "Procfile"
+        - "*.yaml"
+        - "*.yml"
+        - ".*.yaml"
+        - ".*.yml"
+      exclude:
+        - ".github"
+        - ".github/**"
+        - ".pre-commit-config.yaml"
+        - "*adk-security-rules.yaml"
+    metadata:
+      control_id: L2-03
+      rule_pack: adk-core
+      layer: "Layer 2: Identity, Auth & Least-Privilege IAM"
+      module: "google.adk.cli"
+      category: security
+      cwe: "CWE-489: Active Debug Code"
+      owasp_agentic: "ASI03: Identity & Privilege Abuse"
+      owasp_llm: "LLM06:2025 Excessive Agency"
+      severity_tier: "HIGH"
+      owasp_asi: "ASI03"
+      core_module: "google.adk.cli"
+      title: "ADK Development UI Server Used as Container or Deployment Entrypoint"
+      security_invariant: "Container and service entrypoints must never invoke 'adk web' in shared or production environments."
+      recommended_fix: "Replace 'adk web' entrypoints with get_fast_api_app(web=False) under uvicorn/gunicorn or 'adk api_server' behind authenticated ingress."
+    pattern-regex: '(?m)^(?:[ \t]*(?:CMD|ENTRYPOINT)\b(?:(?![ \t]#)[^\n])*?\badk[\s"'',]+web\b|[ \t]*-?[ \t]*(?:command|entrypoint|args|cmd|run|script)[ \t]*:(?:(?:(?![ \t]#)[^\n])*?\badk[\s"'',]+web\b|[ \t]*(?:[|>][-+]?)?[ \t]*\r?\n(?:[ \t]+-[ \t]*["'']?(?:uv|run|poetry|python3?|-m|sh|bash|-c)["'']?[ \t]*\r?\n)*[ \t]+(?:-?[ \t]*["'']?adk["'']?(?:[\s"'',]+web\b|[ \t]*\r?\n[ \t]*-[ \t]*["'']?web["'']?\b)|(?:uv[ \t]+run[ \t]+|poetry[ \t]+run[ \t]+|exec[ \t]+)?adk[ \t]+web\b))|[ \t]*(?!(?:description|instruction|global_instruction|static_instruction|prompt|summary|notes?|comments?)\b)[a-zA-Z0-9_-]+[ \t]*:[ \t]*(?:(?:exec|(?:uv|poetry|pipenv|pdm)[ \t]+run|sh[ \t]+-c|bash[ \t]+-c)[ \t]+["'']?)?adk[ \t]+web\b|(?![ \t]*(?:#|//))(?:(?![ \t]#)[^\n])*?\[[^\]\n]*?["'']adk["''][ \t]*,[ \t]*["'']web["''])'
+
+  - id: adk-deploy-with-dev-ui
+    message: >-
+      [L2-03 | Layer 2 | adk-core] `--with_ui` bundles the ADK development UI
+      and debug endpoints into a deployed service. Omit `--with_ui` for shared
+      or production deployments.
+    severity: WARNING
+    languages: [regex]
+    paths:
+      include:
+        - "Dockerfile"
+        - "*Dockerfile*"
+        - "*.dockerfile"
+        - "Procfile"
+        - "*.sh"
+        - "*.bash"
+        - "Makefile"
+        - "*.mk"
+        - "*.yaml"
+        - "*.yml"
+        - ".*.yaml"
+        - ".*.yml"
+        - "*.toml"
+        - "*.ps1"
+        - "*.py"
+        - "justfile"
+        - "Taskfile*"
+        - ".env"
+        - ".env.*"
+        - "*.env"
+        - "*.tf"
+        - "*.tfvars"
+        - "*.ini"
+        - "*.cfg"
+        - "*.conf"
+      exclude:
+        - "_site"
+        - "_site/**"
+        - ".github"
+        - ".github/**"
+        - ".pre-commit-config.yaml"
+        - "*adk-security-rules.yaml"
+    metadata:
+      control_id: L2-03
+      rule_pack: adk-core
+      layer: "Layer 2: Identity, Auth & Least-Privilege IAM"
+      module: "google.adk.cli.cli_deploy"
+      category: security
+      cwe: "CWE-489: Active Debug Code"
+      owasp_agentic: "ASI03: Identity & Privilege Abuse"
+      owasp_llm: "LLM06:2025 Excessive Agency"
+      severity_tier: "HIGH"
+      owasp_asi: "ASI03"
+      core_module: "google.adk.cli.cli_deploy"
+      title: "ADK Deployment or API Server Shipping Development UI (--with_ui)"
+      security_invariant: "Production ADK deployments and API servers must never enable --with_ui."
+      recommended_fix: "Remove the --with_ui flag from 'adk deploy' and 'adk api_server' invocations."
+    pattern-regex: '(?m)^(?![ \t]*(?:#|//))(?:(?![ \t]#)[^\n])*?\badk[\s"'',]+(?:api_server|deploy[\s"'',]+\w+)\b(?:(?![ \t]#)[^\n]|\\\r?\n(?![ \t]*#))*?--with_ui\b'
+
+  - id: adk-deploy-cloud-run-allow-unauthenticated
+    message: >-
+      [L2-03 | Layer 2 | adk-core] `adk deploy cloud_run` passes
+      `--allow-unauthenticated`, exposing the ADK API server (which has no
+      built-in authentication) publicly on the internet. Remove
+      `--allow-unauthenticated` and enforce Cloud Run IAM or Identity-Aware
+      Proxy (IAP).
+    severity: ERROR
+    languages: [regex]
+    paths:
+      include:
+        - "Dockerfile"
+        - "*Dockerfile*"
+        - "*.dockerfile"
+        - "Procfile"
+        - "*.sh"
+        - "*.bash"
+        - "Makefile"
+        - "*.mk"
+        - "*.yaml"
+        - "*.yml"
+        - ".*.yaml"
+        - ".*.yml"
+        - "*.toml"
+        - "*.ps1"
+        - "*.py"
+        - "justfile"
+        - "Taskfile*"
+        - ".env"
+        - ".env.*"
+        - "*.env"
+        - "*.tf"
+        - "*.tfvars"
+        - "*.ini"
+        - "*.cfg"
+        - "*.conf"
+      exclude:
+        - "_site"
+        - "_site/**"
+        - ".github"
+        - ".github/**"
+        - ".pre-commit-config.yaml"
+        - "*adk-security-rules.yaml"
+    metadata:
+      control_id: L2-03
+      rule_pack: adk-core
+      layer: "Layer 2: Identity, Auth & Least-Privilege IAM"
+      module: "google.adk.cli.cli_deploy"
+      category: security
+      cwe: "CWE-306: Missing Authentication for Critical Function"
+      owasp_agentic: "ASI03: Identity & Privilege Abuse"
+      owasp_llm: "LLM06:2025 Excessive Agency"
+      severity_tier: "CRITICAL"
+      owasp_asi: "ASI03"
+      core_module: "google.adk.cli.cli_deploy"
+      title: "Unauthenticated Cloud Run ADK Deployment (--allow-unauthenticated)"
+      security_invariant: "Cloud Run ADK deployments must never pass --allow-unauthenticated; ingress must enforce Cloud Run IAM or IAP."
+      recommended_fix: "Remove --allow-unauthenticated from 'adk deploy cloud_run' and require authenticated Cloud Run IAM invokers or Identity-Aware Proxy (IAP)."
+    pattern-regex: '(?m)^(?![ \t]*(?:#|//))(?:(?![ \t]#)[^\n])*?\badk[\s"'',]+deploy[\s"'',]+cloud_run\b(?:(?![ \t]#)[^\n]|\\\r?\n(?![ \t]*#))*?--allow-unauthenticated\b'
+
+  - id: adk-dev-remote-agent-builder-enabled
+    message: >-
+      [L2-03 | Layer 2 | adk-core] `ADK_ALLOW_REMOTE_AGENT_BUILDER` is enabled,
+      bypassing the localhost peer check on ADK agent-builder routes and allowing
+      remote network callers to write `.py` agent modules imported by the server
+      (remote code execution). Remove this setting outside strictly isolated
+      local loopback development.
+    severity: ERROR
+    languages: [regex]
+    paths:
+      include:
+        - "Dockerfile"
+        - "*Dockerfile*"
+        - "*.dockerfile"
+        - "Procfile"
+        - "*.sh"
+        - "*.bash"
+        - "Makefile"
+        - "*.mk"
+        - "*.yaml"
+        - "*.yml"
+        - ".*.yaml"
+        - ".*.yml"
+        - "*.toml"
+        - "*.json"
+        - ".*.json"
+        - "*.ps1"
+        - "*.py"
+        - "justfile"
+        - "Taskfile*"
+        - ".env"
+        - ".env.*"
+        - "*.env"
+        - "*.tf"
+        - "*.tfvars"
+        - "*.ini"
+        - "*.cfg"
+        - "*.conf"
+      exclude:
+        - "_site"
+        - "_site/**"
+        - ".github"
+        - ".github/**"
+        - ".pre-commit-config.yaml"
+        - "*adk-security-rules.yaml"
+    metadata:
+      control_id: L2-03
+      rule_pack: adk-core
+      layer: "Layer 2: Identity, Auth & Least-Privilege IAM"
+      module: "google.adk.cli.adk_web_server"
+      category: security
+      cwe: "CWE-94: Improper Control of Generation of Code"
+      owasp_agentic: "ASI05: Unexpected Code Execution (RCE)"
+      owasp_llm: "LLM06:2025 Excessive Agency"
+      severity_tier: "CRITICAL"
+      owasp_asi: "ASI05"
+      core_module: "google.adk.cli.adk_web_server"
+      title: "Remote ADK Agent Builder Enabled (Remote Code Execution)"
+      security_invariant: "ADK_ALLOW_REMOTE_AGENT_BUILDER must never be enabled (1, true, or yes) in shared or deployed environments."
+      recommended_fix: "Unset ADK_ALLOW_REMOTE_AGENT_BUILDER (or set it to 0/false) and disable agent-builder endpoints outside isolated local loopback development."
+    pattern-regex: '(?mi)^(?![ \t]*(?:#|//))(?:[^#\n]*?\bADK_ALLOW_REMOTE_AGENT_BUILDER\b["'']?\]?[ \t]*(?:[:=]|,|[ \t]*\r?\n[ \t]*value[ \t]*[:=])[ \t]*["'']?(?:1|true|yes)\b|[ \t]*ENV[ \t]+ADK_ALLOW_REMOTE_AGENT_BUILDER[ \t]+["'']?(?:1|true|yes)\b)'
+
+  - id: adk-deploy-gke-public-loadbalancer
+    message: >-
+      [L2-03 | Layer 2 | adk-core] `adk deploy gke --service_type=LoadBalancer`
+      exposes the unauthenticated ADK API server directly on an external IP. Keep
+      the default `ClusterIP` service type and front the deployment with
+      authenticated ingress such as Identity-Aware Proxy (IAP).
+    severity: ERROR
+    languages: [regex]
+    paths:
+      include:
+        - "Dockerfile"
+        - "*Dockerfile*"
+        - "*.dockerfile"
+        - "Procfile"
+        - "*.sh"
+        - "*.bash"
+        - "Makefile"
+        - "*.mk"
+        - "*.yaml"
+        - "*.yml"
+        - ".*.yaml"
+        - ".*.yml"
+        - "*.toml"
+        - "*.ps1"
+        - "*.py"
+        - "justfile"
+        - "Taskfile*"
+        - ".env"
+        - ".env.*"
+        - "*.env"
+        - "*.tf"
+        - "*.tfvars"
+        - "*.ini"
+        - "*.cfg"
+        - "*.conf"
+      exclude:
+        - "_site"
+        - "_site/**"
+        - ".github"
+        - ".github/**"
+        - ".pre-commit-config.yaml"
+        - "*adk-security-rules.yaml"
+    metadata:
+      control_id: L2-03
+      rule_pack: adk-core
+      layer: "Layer 2: Identity, Auth & Least-Privilege IAM"
+      module: "google.adk.cli.cli_deploy"
+      category: security
+      cwe: "CWE-306: Missing Authentication for Critical Function"
+      owasp_agentic: "ASI03: Identity & Privilege Abuse"
+      owasp_llm: "LLM06:2025 Excessive Agency"
+      severity_tier: "CRITICAL"
+      owasp_asi: "ASI03"
+      core_module: "google.adk.cli.cli_deploy"
+      title: "Public GKE LoadBalancer Service for Unauthenticated ADK Server"
+      security_invariant: "GKE ADK deployments must not expose the unauthenticated server via --service_type=LoadBalancer."
+      recommended_fix: "Keep the default ClusterIP service type on 'adk deploy gke' and front the GKE service with Identity-Aware Proxy (IAP) or an authenticated Gateway."
+    pattern-regex: '(?m)^(?![ \t]*(?:#|//))(?:(?![ \t]#)[^\n])*?\badk[\s"'',]+deploy[\s"'',]+gke\b(?:(?![ \t]#)[^\n]|\\\r?\n(?![ \t]*#))*?--service_type[=\s"'',]+LoadBalancer\b'
+
+  - id: adk-trigger-cli-no-service-account-allowlist
+    message: >-
+      [L2-03 | Layer 2 | adk-core] ADK `/trigger/*` endpoints are enabled via
+      `--trigger_sources` on the CLI without `--trigger_oidc_service_accounts`.
+      Any Google principal able to mint an OIDC token for the audience will be
+      accepted. Specify an explicit service-account allowlist via
+      `--trigger_oidc_service_accounts`.
+    severity: WARNING
+    languages: [regex]
+    paths:
+      include:
+        - "Dockerfile"
+        - "*Dockerfile*"
+        - "*.dockerfile"
+        - "Procfile"
+        - "*.sh"
+        - "*.bash"
+        - "Makefile"
+        - "*.mk"
+        - "*.yaml"
+        - "*.yml"
+        - ".*.yaml"
+        - ".*.yml"
+        - "*.toml"
+        - "*.ps1"
+        - "*.py"
+        - "justfile"
+        - "Taskfile*"
+        - ".env"
+        - ".env.*"
+        - "*.env"
+        - "*.tf"
+        - "*.tfvars"
+        - "*.ini"
+        - "*.cfg"
+        - "*.conf"
+      exclude:
+        - "_site"
+        - "_site/**"
+        - ".github"
+        - ".github/**"
+        - ".pre-commit-config.yaml"
+        - "*adk-security-rules.yaml"
+    metadata:
+      control_id: L2-03
+      rule_pack: adk-core
+      layer: "Layer 2: Identity, Auth & Least-Privilege IAM"
+      module: "google.adk.cli"
+      category: security
+      cwe: "CWE-285: Improper Authorization"
+      owasp_agentic: "ASI03: Identity & Privilege Abuse"
+      owasp_llm: "LLM06:2025 Excessive Agency"
+      severity_tier: "HIGH"
+      owasp_asi: "ASI03"
+      core_module: "google.adk.cli"
+      title: "ADK CLI Trigger Endpoints Missing OIDC Service Account Allowlist"
+      security_invariant: "CLI invocations enabling --trigger_sources must also specify --trigger_oidc_service_accounts to restrict caller identities."
+      recommended_fix: "Pass --trigger_oidc_audience and --trigger_oidc_service_accounts=<service-account-email> whenever --trigger_sources is enabled."
+    pattern-regex: '(?m)^(?![ \t]*(?:#|//))(?:(?!--trigger_oidc_service_accounts)(?:(?![ \t]#)[^\n]|\\\r?\n(?![ \t]*#)))*?\badk[\s"'',]+(?:web|api_server|deploy)\b(?:(?!--trigger_oidc_service_accounts)(?:(?![ \t]#)[^\n]|\\\r?\n(?![ \t]*#)))*?--trigger_sources\b(?:(?!--trigger_oidc_service_accounts)(?:(?![ \t]#)[^\n]|\\\r?\n(?![ \t]*#)))*(?:[ \t]+#[^\n]*)?(?<!\\)$'

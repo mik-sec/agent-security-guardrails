@@ -1,0 +1,259 @@
+# Copyright 2026 The Agent Security Guardrails Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Agent security scan for pull requests.
+#
+# Run it from other repositories in one of two ways:
+#   1. Reusable workflow (any GitHub plan): add the small caller workflow from
+#      README.md to the target repository.
+#   2. Ruleset workflow (GitHub Enterprise): an organization or enterprise
+#      ruleset requires this file to pass, with no file in the target repo.
+#
+# The job checks out the pull request, runs scanner/scan_agent_codebase.py
+# (AST checks plus Opengrep with the adk-core, mcp and gcp-gemini rules), then:
+#   * adds inline annotations to the "Files changed" tab,
+#   * posts review comments on the lines the pull request changed,
+#   * keeps one summary comment up to date (LGTM when the scan is clean),
+#   * fails the check on findings at `fail_on` severities when `enforce` is on.
+
+name: Agent Security Scan
+
+on:
+  workflow_call:
+    inputs:
+      enforce:
+        description: "Fail the check on findings at fail_on severities (blocks merge when the check is required)."
+        type: boolean
+        default: false
+      fail_on:
+        description: "Comma-separated severities that fail the check when enforce is on."
+        type: string
+        default: "CRITICAL,HIGH"
+      packs:
+        description: "Rule packs to add to adk-core: mcp, gcp-gemini, all, or empty for adk-core only."
+        type: string
+        default: "all"
+      runs_on:
+        description: "Runner label, for example self-hosted."
+        type: string
+        default: "ubuntu-latest"
+  pull_request:
+
+permissions:
+  contents: read
+  pull-requests: write
+
+env:
+  GUARDRAILS_REPO: mik-sec/agent-security-guardrails
+  GUARDRAILS_REF: main
+  OPENGREP_VERSION: v1.30.0
+  OPENGREP_SHA256: 35779bdd72e92129c8df2a77f0c55e8c08356801ea92591ef32108d6b28d564c
+
+jobs:
+  scan:
+    name: Agent security scan
+    runs-on: ${{ inputs.runs_on || 'ubuntu-latest' }}
+    timeout-minutes: 15
+    env:
+      # Inputs are empty when this file runs as a ruleset workflow (inputs.runs_on
+      # is always set when it is called), so fall back to defaults there. In that
+      # mode AGENT_SECURITY_ENFORCE comes from the target repository's (or its
+      # organization's) Actions variables.
+      ENFORCE: ${{ inputs.runs_on && inputs.enforce || (!inputs.runs_on && vars.AGENT_SECURITY_ENFORCE) || 'false' }}
+      FAIL_ON: ${{ inputs.fail_on || vars.AGENT_SECURITY_FAIL_ON || 'CRITICAL,HIGH' }}
+      # inputs.runs_on is always set when called as a reusable workflow, so an
+      # empty packs input there means "adk-core only".
+      PACKS: ${{ inputs.runs_on && inputs.packs || (!inputs.runs_on && 'all' || '') }}
+      LANG: C.UTF-8
+      LC_ALL: C.UTF-8
+      PYTHONUTF8: "1"
+    steps:
+      - name: Check out pull request
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+
+      - name: Check out scanner
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          repository: ${{ env.GUARDRAILS_REPO }}
+          ref: ${{ env.GUARDRAILS_REF }}
+          path: .agent-security-guardrails
+          persist-credentials: false
+
+      - name: Install Opengrep
+        run: |
+          mkdir -p "$RUNNER_TEMP/bin"
+          curl -fsSL -o "$RUNNER_TEMP/bin/opengrep" \
+            "https://github.com/opengrep/opengrep/releases/download/${OPENGREP_VERSION}/opengrep_manylinux_x86"
+          echo "${OPENGREP_SHA256}  $RUNNER_TEMP/bin/opengrep" | sha256sum -c -
+          chmod +x "$RUNNER_TEMP/bin/opengrep"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+
+      - name: Load suppressions from the base branch
+        # THREAT_MODEL.md can suppress findings, so read it from the base branch:
+        # a pull request cannot suppress its own findings.
+        if: github.event.pull_request
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          curl -fsSL -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github.raw" \
+            "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/contents/THREAT_MODEL.md?ref=$BASE_SHA" \
+            -o "$RUNNER_TEMP/THREAT_MODEL.md" || rm -f "$RUNNER_TEMP/THREAT_MODEL.md"
+
+      - name: Run scan
+        run: |
+          # Keep the scanner checkout out of the scanned tree.
+          mv .agent-security-guardrails "$RUNNER_TEMP/guardrails"
+          args=(--input . --engine hybrid --format json --output "$RUNNER_TEMP/scan.json")
+          if [ -n "$PACKS" ]; then args+=(--packs "$PACKS"); fi
+          if [ -f "$RUNNER_TEMP/THREAT_MODEL.md" ]; then args+=(--threat-model "$RUNNER_TEMP/THREAT_MODEL.md"); fi
+          python3 "$RUNNER_TEMP/guardrails/scanner/scan_agent_codebase.py" "${args[@]}"
+          python3 - "$RUNNER_TEMP" << 'EOF'
+          import json, sys
+          tmp = sys.argv[1]
+          sys.path.insert(0, f"{tmp}/guardrails/scanner")
+          import scan_agent_codebase as scanner
+          with open(f"{tmp}/scan.json", encoding="utf-8") as f:
+              report = json.load(f)
+          with open(f"{tmp}/agent-security.sarif", "w", encoding="utf-8") as f:
+              f.write(scanner.format_sarif_report(report) + "\n")
+          EOF
+
+      - name: Report results
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8.0.0
+        env:
+          SCAN_JSON: ${{ runner.temp }}/scan.json
+        with:
+          script: |
+            const fs = require('fs');
+            const report = JSON.parse(fs.readFileSync(process.env.SCAN_JSON, 'utf8'));
+            const enforce = String(process.env.ENFORCE).toLowerCase() === 'true';
+            const failOn = new Set(process.env.FAIL_ON.split(',').map(s => s.trim().toUpperCase()).filter(Boolean));
+            const rank = {CRITICAL: 0, HIGH: 1, MEDIUM: 2, LOW: 3};
+            const findings = (report.findings || [])
+              .filter(f => f.status === 'ACTION_REQUIRED')
+              .sort((a, b) => (rank[a.severity] ?? 9) - (rank[b.severity] ?? 9) || a.file.localeCompare(b.file) || a.line - b.line);
+            const blocking = findings.filter(f => failOn.has(String(f.severity).toUpperCase()));
+
+            // Text that comes from scanned code: one line, no backticks, no @mentions.
+            const safe = s => String(s ?? '').replace(/\s+/g, ' ').replace(/`/g, "'").replace(/@/g, '@\u200b').trim();
+            const ruleOf = f => (f.function_or_agent || '').includes(':') ? f.function_or_agent.split(':')[1] : f.rule_id;
+            const engineOf = f => (f.function_or_agent || '').startsWith('opengrep:') ? 'Opengrep' : 'AST';
+            const sev = report.summary.by_severity || {};
+            const counts = `CRITICAL ${sev.CRITICAL || 0} · HIGH ${sev.HIGH || 0} · MEDIUM ${sev.MEDIUM || 0} · LOW ${sev.LOW || 0}`;
+            const verdict = findings.length === 0
+              ? 'LGTM: no agent security findings.'
+              : enforce && blocking.length
+                ? `Merge blocked: ${blocking.length} finding(s) at ${[...failOn].join('/')}.`
+                : `Advisory: ${findings.length} finding(s). Merge is not blocked because enforce is off.`;
+
+            // 1. Inline annotations on "Files changed" (GitHub shows up to 10
+            //    errors and 10 warnings per step; the summary lists every finding).
+            let errors = 0, warnings = 0;
+            for (const f of findings) {
+              const props = {title: `[${f.severity}] ${f.control_id} ${ruleOf(f)}`, file: f.file, startLine: f.line};
+              const text = `${safe(f.description)} Fix: ${safe(f.recommended_fix)}`;
+              if (f.severity === 'CRITICAL' || f.severity === 'HIGH') { if (errors++ < 10) core.error(text, props); }
+              else if (warnings++ < 10) core.warning(text, props);
+            }
+
+            // 2. Job summary with every finding.
+            const rows = findings.map(f =>
+              `| ${f.severity} | \`${f.control_id}\` | \`${ruleOf(f)}\` | ${engineOf(f)} | \`${safe(f.file)}:${f.line}\` | ${safe(f.description).replace(/\|/g, '\\|').slice(0, 220)} |`);
+            await core.summary
+              .addHeading('Agent security scan', 2)
+              .addRaw(`**${verdict}**\n\n${counts} · files scanned: ${report.summary.total_files_scanned}\n\n`)
+              .addRaw(rows.length ? ['| Severity | Control | Rule | Engine | Location | Finding |', '| --- | --- | --- | --- | --- | --- |', ...rows].join('\n') + '\n' : '')
+              .write();
+
+            const pr = context.payload.pull_request;
+            if (pr) {
+              const {owner, repo} = context.repo;
+              const bot = 'github-actions[bot]';
+              const marker = '<!-- agent-security-scan -->';
+              const runUrl = `${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`;
+
+              // 3. Review comments on lines this pull request added (one review per commit).
+              const files = await github.paginate(github.rest.pulls.listFiles, {owner, repo, pull_number: pr.number, per_page: 100});
+              const added = new Map();
+              for (const file of files) {
+                const lines = new Set();
+                let n = 0;
+                for (const l of (file.patch || '').split('\n')) {
+                  const hunk = l.match(/^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@/);
+                  if (hunk) { n = Number(hunk[1]); continue; }
+                  if (l.startsWith('+')) lines.add(n++);
+                  else if (l.startsWith(' ')) n++;
+                }
+                added.set(file.filename, lines);
+              }
+              const inline = findings.filter(f => added.get(f.file)?.has(f.line)).slice(0, 30).map(f => ({
+                path: f.file,
+                line: f.line,
+                side: 'RIGHT',
+                body: `**${f.severity} · ${f.control_id} · \`${ruleOf(f)}\`** (${engineOf(f)})\n\n${safe(f.description)}\n\n**Fix:** ${safe(f.recommended_fix)}`,
+              }));
+              const reviews = await github.paginate(github.rest.pulls.listReviews, {owner, repo, pull_number: pr.number});
+              const reviewed = reviews.some(r => r.user?.login === bot && r.commit_id === pr.head.sha && (r.body || '').includes(marker));
+              if (inline.length && !reviewed) {
+                try {
+                  await github.rest.pulls.createReview({
+                    owner, repo, pull_number: pr.number, commit_id: pr.head.sha, event: 'COMMENT',
+                    body: `${marker}\nAgent security scan: ${inline.length} finding(s) on lines this pull request changed.`,
+                    comments: inline,
+                  });
+                } catch (e) {
+                  core.warning(`Could not post review comments: ${e.message}`);
+                }
+              }
+
+              // 4. One summary comment, updated on every run. LGTM is a comment,
+              //    not an approving review, so it never counts as a code review.
+              const status = findings.length === 0 ? 'LGTM ✅' : enforce && blocking.length ? 'merge blocked ❌' : 'findings (advisory) ⚠️';
+              const top = findings.slice(0, 15).map(f => `| ${f.severity} | \`${f.control_id}\` | \`${ruleOf(f)}\` | \`${safe(f.file)}:${f.line}\` |`);
+              const body = [
+                marker,
+                `### Agent security scan: ${status}`,
+                '',
+                findings.length === 0 ? 'No agent security findings in this pull request.' : `${counts}. ${verdict}`,
+                '',
+                ...(top.length ? ['| Severity | Control | Rule | Location |', '| --- | --- | --- | --- |', ...top, ''] : []),
+                findings.length > 15 ? `Showing 15 of ${findings.length} findings.\n` : '',
+                `[Full report and SARIF](${runUrl}) · commit \`${pr.head.sha.slice(0, 7)}\``,
+              ].join('\n');
+              const comments = await github.paginate(github.rest.issues.listComments, {owner, repo, issue_number: pr.number});
+              const mine = comments.find(c => c.user?.login === bot && (c.body || '').startsWith(marker));
+              try {
+                if (mine) await github.rest.issues.updateComment({owner, repo, comment_id: mine.id, body});
+                else await github.rest.issues.createComment({owner, repo, issue_number: pr.number, body});
+              } catch (e) {
+                core.warning(`Could not post the summary comment: ${e.message}`);
+              }
+            }
+
+            if (enforce && blocking.length) {
+              core.setFailed(`${blocking.length} agent security finding(s) at ${[...failOn].join('/')}. See the job summary.`);
+            }
+
+      - name: Upload SARIF report
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: agent-security-sarif
+          path: ${{ runner.temp }}/agent-security.sarif
+          if-no-files-found: ignore
+          retention-days: 7

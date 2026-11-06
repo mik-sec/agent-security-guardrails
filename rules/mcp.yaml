@@ -1,0 +1,876 @@
+# Copyright 2026 The Agent Security Guardrails Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+
+# ==============================================================================
+# Agent Security Guardrails — OPTIONAL rule pack: Model Context Protocol (MCP)
+# rule_pack: mcp
+#
+# MCP client and server hardening for agents: DNS rebinding protection, unpinned
+# or auto-approved MCP servers, CLI-argument secrets, inbound bearer-token
+# passthrough, required credential parameters on @mcp.tool functions, trust in
+# server-supplied tool annotations, remote schema $ref,
+# sampling context over-sharing, and null JSON-RPC request IDs. Covers Python,
+# JSON and YAML (`mcpServers` / `servers` / `mcp_servers`, ADK `server_params`).
+# TOML configs are not covered (neither engine parses TOML). Expect some false
+# positives; have a reviewer triage them rather than adding `# nosemgrep`.
+#
+# Compatible with Opengrep and Semgrep OSS:
+#   opengrep scan --config rules/mcp.yaml <path>
+# ==============================================================================
+
+rules:
+  # ----------------------------------------------------------------------------
+  # L3-03: MCP Python SDK transport with DNS rebinding protection disabled
+  # ----------------------------------------------------------------------------
+  - id: mcp-dns-rebinding-protection-disabled
+    message: >-
+      [L3-03 | Layer 3 | mcp] MCP server transport sets
+      enable_dns_rebinding_protection=False, so the Host and Origin headers of
+      incoming HTTP / SSE requests are no longer validated and any web page the
+      user opens can use DNS rebinding to reach this MCP server and call its
+      tools. Remove the False (the default is True) and list allowed_hosts /
+      allowed_origins for the deployed hostnames.
+    severity: ERROR
+    languages: [python]
+    metadata:
+      control_id: "L3-03"
+      rule_pack: "mcp"
+      layer: "Layer 3: Tool, Data Connector & Network Safety"
+      category: security
+      cwe: "CWE-346: Origin Validation Error"
+      owasp_asi: "ASI02"
+      severity_tier: "HIGH"
+      title: "MCP DNS Rebinding Protection Disabled"
+      recommended_fix: "Drop enable_dns_rebinding_protection=False (the default is True) and pass mcp.server.transport_security.TransportSecuritySettings(allowed_hosts=[\"mcp.example.com\", \"localhost:8000\"], allowed_origins=[\"https://app.example.com\"]) listing the hostnames you deploy, e.g. FastMCP(..., transport_security=...)."
+    pattern-either:
+      # mcp.server.transport_security.TransportSecuritySettings (plain or module-qualified)
+      - pattern: TransportSecuritySettings(..., enable_dns_rebinding_protection=False, ...)
+      - pattern: $MODULE.TransportSecuritySettings(..., enable_dns_rebinding_protection=False, ...)
+      # FastMCP(transport_security={...}) dict form and post-construction mutation
+      - pattern: |
+          $SERVER(..., transport_security={..., "enable_dns_rebinding_protection": False, ...}, ...)
+      - pattern: $SETTINGS.enable_dns_rebinding_protection = False
+
+  # ----------------------------------------------------------------------------
+  # L3-03: MCP server config launches an unpinned package (JSON)
+  # ----------------------------------------------------------------------------
+  - id: mcp-server-unpinned-package
+    message: >-
+      [L3-03 | Layer 3 | mcp] MCP server in "$SERVERS" runs
+      $COMMAND with an unpinned package (-y / --yes, @latest, or an
+      npx / uvx / pipx / bunx launch with no @x.y.z or ==x.y.z version), so
+      every agent start downloads and executes whatever version is currently
+      published, including a compromised release. Pin the exact package
+      version and drop -y / --yes / @latest.
+    severity: WARNING
+    languages: [json]
+    metadata:
+      control_id: "L3-03"
+      rule_pack: "mcp"
+      layer: "Layer 3: Tool, Data Connector & Network Safety"
+      category: security
+      cwe: "CWE-829: Inclusion of Functionality from Untrusted Control Sphere"
+      owasp_asi: "ASI04"
+      owasp_llm: "LLM03:2025 Supply Chain"
+      severity_tier: "HIGH"
+      title: "Unpinned MCP Server Package"
+      recommended_fix: "Pin the server package to an exact version (\"args\": [\"@modelcontextprotocol/server-filesystem@2025.8.21\", ...] for npx/bunx, \"mcp-server-fetch==2025.4.7\" for uvx/pipx), remove -y / --yes and @latest, or install the server as a locked dependency and launch its binary directly."
+    patterns:
+      # Server maps: mcpServers (Gemini CLI settings.json and most MCP clients),
+      # servers (VS Code .vscode/mcp.json), mcp_servers.
+      - pattern-inside: |
+          "$SERVERS": $SERVER_MAP
+      - metavariable-regex:
+          metavariable: $SERVERS
+          regex: '^["'']?(?:mcpServers|servers|mcp_servers)["'']?$'
+      # Mirrors the core scanner's McpToolset / StdioConnectionParams check.
+      - pattern-either:
+          # (a) -y / --yes or a package ending in @latest
+          - patterns:
+              - pattern: |
+                  {..., "command": $COMMAND, ..., "args": $ARGS, ...}
+              - metavariable-regex:
+                  metavariable: $ARGS
+                  regex: '(?s)^.*(?:["''](?:-y|--yes)["'']|@latest(?:["''\s,\]]|$))'
+          # (b) npx / uvx / pipx / bunx command with no @<digit> / ==<digit> pin
+          - patterns:
+              - pattern: |
+                  {..., "command": $COMMAND, ..., "args": $ARGS, ...}
+              - metavariable-regex:
+                  metavariable: $COMMAND
+                  regex: '^["'']?(?:[^"''\s]*[/\\])?(?:npx|uvx|pipx|bunx)(?:\.cmd|\.exe)?["'']?$'
+              - metavariable-regex:
+                  metavariable: $ARGS
+                  regex: '(?s)^(?!.*(?:@|==)\d)'
+          # (c) runner passed through a shell, e.g. "command": "cmd", "args": ["/c", "npx", ...]
+          - patterns:
+              - pattern: |
+                  {..., "command": $COMMAND, ..., "args": $ARGS, ...}
+              - metavariable-regex:
+                  metavariable: $ARGS
+                  regex: '(?s)^(?!.*(?:@|==)\d).*["''](?:npx|uvx|pipx|bunx)(?:\.cmd|\.exe)?["'']'
+
+  # ----------------------------------------------------------------------------
+  # L3-03: MCP server config launches an unpinned package (YAML)
+  # ----------------------------------------------------------------------------
+  - id: mcp-server-unpinned-package-yaml
+    message: >-
+      [L3-03 | Layer 3 | mcp] MCP server under `$SERVERS` runs
+      `$COMMAND` with an unpinned package (-y / --yes, @latest, or an
+      npx / uvx / pipx / bunx launch with no @x.y.z or ==x.y.z version), so
+      every agent start downloads and executes whatever version is currently
+      published, including a compromised release. Pin the exact package
+      version and drop -y / --yes / @latest.
+    severity: WARNING
+    languages: [yaml]
+    metadata:
+      control_id: "L3-03"
+      rule_pack: "mcp"
+      layer: "Layer 3: Tool, Data Connector & Network Safety"
+      category: security
+      cwe: "CWE-829: Inclusion of Functionality from Untrusted Control Sphere"
+      owasp_asi: "ASI04"
+      owasp_llm: "LLM03:2025 Supply Chain"
+      severity_tier: "HIGH"
+      title: "Unpinned MCP Server Package (YAML)"
+      recommended_fix: "Pin the server package to an exact version (args: [\"@modelcontextprotocol/server-filesystem@2025.8.21\", ...] for npx/bunx, mcp-server-fetch==2025.4.7 for uvx/pipx), remove -y / --yes and @latest, or install the server as a locked dependency and launch its binary directly."
+    patterns:
+      # Server maps or lists (mcpServers, servers, mcp_servers) and ADK agent-config
+      # McpToolset params (stdio_connection_params.server_params, stdio_server_params).
+      - pattern-inside: |
+          $SERVERS: $SERVER_MAP
+      - metavariable-regex:
+          metavariable: $SERVERS
+          regex: '^["'']?(?:mcpServers|servers|mcp_servers|server_params|stdio_server_params)["'']?$'
+      - pattern-either:
+          # (a) -y / --yes (quoted, block item or flow item) or a package ending in @latest
+          - patterns:
+              - pattern: |
+                  command: $COMMAND
+                  ...
+                  args: $ARGS
+                  ...
+              - metavariable-regex:
+                  metavariable: $ARGS
+                  regex: '(?s)^.*(?:["''](?:-y|--yes)["'']|(?:^|\n)[ \t]*-[ \t]+(?:-y|--yes)[ \t]*(?:\n|$)|[\[,][ \t]*(?:-y|--yes)[ \t]*(?:[,\]]|$)|@latest(?:["''\s,\]]|$))'
+          # (b) npx / uvx / pipx / bunx command with no @<digit> / ==<digit> pin
+          - patterns:
+              - pattern: |
+                  command: $COMMAND
+                  ...
+                  args: $ARGS
+                  ...
+              - metavariable-regex:
+                  metavariable: $COMMAND
+                  regex: '^["'']?(?:[^"''\s]*[/\\])?(?:npx|uvx|pipx|bunx)(?:\.cmd|\.exe)?["'']?$'
+              - metavariable-regex:
+                  metavariable: $ARGS
+                  regex: '(?s)^(?!.*(?:@|==)\d)'
+          # (c) runner passed through a shell, e.g. command: cmd, args: [/c, npx, ...]
+          - patterns:
+              - pattern: |
+                  command: $COMMAND
+                  ...
+                  args: $ARGS
+                  ...
+              - metavariable-regex:
+                  metavariable: $ARGS
+                  regex: '(?s)^(?!.*(?:@|==)\d).*(?:["''](?:npx|uvx|pipx|bunx)(?:\.cmd|\.exe)?["'']|(?:^|\n)[ \t]*-[ \t]+(?:npx|uvx|pipx|bunx)(?:\.cmd|\.exe)?[ \t]*(?:\n|$)|[\[,][ \t]*(?:npx|uvx|pipx|bunx)(?:\.cmd|\.exe)?[ \t]*(?:[,\]]|$))'
+
+  # ----------------------------------------------------------------------------
+  # L2-01: Inbound caller Authorization token passed straight to downstream MCP
+  # ----------------------------------------------------------------------------
+  - id: mcp-inbound-token-passthrough
+    message: >-
+      [L2-01 | Layer 2 | mcp] An inbound HTTP `Authorization`
+      or access-token header is forwarded directly into a downstream MCP
+      transport without OAuth 2.0 Token Exchange or audience downscoping
+      (Confused Deputy). Exchange inbound tokens for a target-scoped token via
+      STS / `DownscopedCredentials` / `fetch_id_token` before calling downstream
+      MCP servers.
+    mode: taint
+    severity: ERROR
+    languages: [python]
+    metadata:
+      control_id: "L2-01"
+      rule_pack: "mcp"
+      layer: "Layer 2: Identity, Auth & Least-Privilege IAM"
+      category: security
+      cwe: "CWE-441: Unintended Proxy or Intermediary ('Confused Deputy')"
+      owasp_asi: "ASI03"
+      owasp_llm: "LLM06:2025 Excessive Agency"
+      severity_tier: "CRITICAL"
+      title: "Inbound Bearer Token Passthrough to Downstream MCP Server"
+      recommended_fix: "Never forward raw inbound request Authorization headers to downstream MCP servers; exchange or mint a target-audience token via STS token exchange, DownscopedCredentials, or google.oauth2.id_token.fetch_id_token()."
+    pattern-sources:
+      - patterns:
+          - pattern-either:
+              - pattern: $REQ.headers.get("$HDR", ...)
+              - pattern: $REQ.headers.get("$HDR")
+              - pattern: $REQ.headers["$HDR"]
+          - metavariable-regex:
+              metavariable: $HDR
+              regex: '(?i)^(?:authorization|x-forwarded-access-token|x-access-token)$'
+    pattern-sanitizers:
+      - pattern: $STS.exchange_token(...)
+      - pattern: exchange_token(...)
+      - pattern: DownscopedCredentials(...)
+      - pattern: $MOD.DownscopedCredentials(...)
+      - pattern: impersonated_credentials.Credentials(...)
+      - pattern: $MOD.fetch_id_token(...)
+      - pattern: fetch_id_token(...)
+    pattern-sinks:
+      - patterns:
+          - pattern-either:
+              - pattern: StreamableHttpConnectionParams(..., headers=$SINK, ...)
+              - pattern: $MOD.StreamableHttpConnectionParams(..., headers=$SINK, ...)
+              - pattern: StreamableHTTPConnectionParams(..., headers=$SINK, ...)
+              - pattern: $MOD.StreamableHTTPConnectionParams(..., headers=$SINK, ...)
+              - pattern: SseConnectionParams(..., headers=$SINK, ...)
+              - pattern: $MOD.SseConnectionParams(..., headers=$SINK, ...)
+              - pattern: SSEConnectionParams(..., headers=$SINK, ...)
+              - pattern: $MOD.SSEConnectionParams(..., headers=$SINK, ...)
+              - pattern: SseServerParams(..., headers=$SINK, ...)
+              - pattern: $MOD.SseServerParams(..., headers=$SINK, ...)
+              - pattern: streamablehttp_client(..., headers=$SINK, ...)
+              - pattern: $MOD.streamablehttp_client(..., headers=$SINK, ...)
+              - pattern: sse_client(..., headers=$SINK, ...)
+              - pattern: $MOD.sse_client(..., headers=$SINK, ...)
+          - focus-metavariable: $SINK
+      - patterns:
+          - pattern-inside: |
+              def $HP(...):
+                ...
+          - metavariable-regex:
+              metavariable: $HP
+              regex: '(?i)^.*header.*$'
+          - pattern: |
+              return {..., "$AUTH_KEY": $SINK, ...}
+          - metavariable-regex:
+              metavariable: $AUTH_KEY
+              regex: '(?i)^(?:authorization|x-forwarded-access-token|x-access-token)$'
+          - focus-metavariable: $SINK
+
+  # ----------------------------------------------------------------------------
+  # L2-01: MCP server @mcp.tool requires a raw credential parameter from the LLM
+  # ----------------------------------------------------------------------------
+  - id: mcp-tool-credential-parameter
+    message: >-
+      [L2-01 | Layer 2 | mcp] MCP tool `$F` requires credential parameter `$CRED`
+      from the model. Secrets passed as LLM tool arguments appear in prompts,
+      session transcripts, and traces. Load credentials server-side from Secret
+      Manager, environment configuration, or the verified MCP authorization
+      context.
+    severity: WARNING
+    languages: [python]
+    metadata:
+      control_id: "L2-01"
+      rule_pack: "mcp"
+      layer: "Layer 2: Identity, Auth & Least-Privilege IAM"
+      category: security
+      cwe: "CWE-522: Insufficiently Protected Credentials"
+      owasp_asi: "ASI03"
+      owasp_llm: "LLM02:2025 Sensitive Information Disclosure"
+      severity_tier: "HIGH"
+      title: "MCP Tool Signature Requires Raw Credential Parameter"
+      recommended_fix: "Remove credential parameters from @mcp.tool signatures and load secrets server-side from Secret Manager, environment configuration, or the verified MCP authorization context."
+    patterns:
+      - pattern-either:
+          - pattern: |
+              @$MCP.tool(...)
+              def $F(..., $CRED, ...):
+                ...
+          - pattern: |
+              @$MCP.tool(...)
+              async def $F(..., $CRED, ...):
+                ...
+          - pattern: |
+              @$MCP.tool
+              def $F(..., $CRED, ...):
+                ...
+          - pattern: |
+              @$MCP.tool
+              async def $F(..., $CRED, ...):
+                ...
+      - metavariable-regex:
+          metavariable: $CRED
+          regex: '^(?:access_token|refresh_token|bearer_token|id_token|oauth_token|auth_token|api_key|apikey|client_secret|password|passwd|secret_key|private_key)$'
+      - metavariable-regex:
+          metavariable: $F
+          regex: '^(?!.*(?:^|_)(?:create|reset|set|update|change|rotate|add|register|provision|invite|new)_).*$'
+      - pattern-not: |
+          @$MCP.tool(...)
+          def $F(..., $CRED: Optional[$T] = $D, ...):
+            ...
+      - pattern-not: |
+          @$MCP.tool(...)
+          def $F(..., $CRED: Optional[$T], ...):
+            ...
+      - pattern-not: |
+          @$MCP.tool(...)
+          def $F(..., $CRED: $T | None = $D, ...):
+            ...
+      - pattern-not: |
+          @$MCP.tool(...)
+          def $F(..., $CRED: $T | None, ...):
+            ...
+      - pattern-not: |
+          @$MCP.tool(...)
+          def $F(..., $CRED: $T = None, ...):
+            ...
+      - pattern-not: |
+          @$MCP.tool(...)
+          def $F(..., $CRED = None, ...):
+            ...
+      - pattern-not: |
+          @$MCP.tool(...)
+          def $F(..., $CRED: Annotated[Optional[$T], ...] = $D, ...):
+            ...
+      - pattern-not: |
+          @$MCP.tool(...)
+          def $F(..., $CRED: Annotated[$T | None, ...] = $D, ...):
+            ...
+      - pattern-not: |
+          @$MCP.tool(...)
+          def $F(..., $CRED: Annotated[$T, ...] = None, ...):
+            ...
+      - pattern-not: |
+          @$MCP.tool(...)
+          def $F(..., $CRED: Union[$T, None] = $D, ...):
+            ...
+      - pattern-not: |
+          @$MCP.tool(...)
+          def $F(..., $CRED: Union[None, $T] = $D, ...):
+            ...
+      - pattern-not: |
+          @$MCP.tool(...)
+          async def $F(..., $CRED: Optional[$T] = $D, ...):
+            ...
+      - pattern-not: |
+          @$MCP.tool(...)
+          async def $F(..., $CRED: Optional[$T], ...):
+            ...
+      - pattern-not: |
+          @$MCP.tool(...)
+          async def $F(..., $CRED: $T | None = $D, ...):
+            ...
+      - pattern-not: |
+          @$MCP.tool(...)
+          async def $F(..., $CRED: $T | None, ...):
+            ...
+      - pattern-not: |
+          @$MCP.tool(...)
+          async def $F(..., $CRED: $T = None, ...):
+            ...
+      - pattern-not: |
+          @$MCP.tool(...)
+          async def $F(..., $CRED = None, ...):
+            ...
+      - pattern-not: |
+          @$MCP.tool(...)
+          async def $F(..., $CRED: Annotated[Optional[$T], ...] = $D, ...):
+            ...
+      - pattern-not: |
+          @$MCP.tool(...)
+          async def $F(..., $CRED: Annotated[$T | None, ...] = $D, ...):
+            ...
+      - pattern-not: |
+          @$MCP.tool(...)
+          async def $F(..., $CRED: Annotated[$T, ...] = None, ...):
+            ...
+      - pattern-not: |
+          @$MCP.tool(...)
+          async def $F(..., $CRED: Union[$T, None] = $D, ...):
+            ...
+      - pattern-not: |
+          @$MCP.tool(...)
+          async def $F(..., $CRED: Union[None, $T] = $D, ...):
+            ...
+      - pattern-not: |
+          @$MCP.tool
+          def $F(..., $CRED: Optional[$T] = $D, ...):
+            ...
+      - pattern-not: |
+          @$MCP.tool
+          def $F(..., $CRED: Optional[$T], ...):
+            ...
+      - pattern-not: |
+          @$MCP.tool
+          def $F(..., $CRED: $T | None = $D, ...):
+            ...
+      - pattern-not: |
+          @$MCP.tool
+          def $F(..., $CRED: $T | None, ...):
+            ...
+      - pattern-not: |
+          @$MCP.tool
+          def $F(..., $CRED: $T = None, ...):
+            ...
+      - pattern-not: |
+          @$MCP.tool
+          def $F(..., $CRED = None, ...):
+            ...
+      - pattern-not: |
+          @$MCP.tool
+          def $F(..., $CRED: Annotated[Optional[$T], ...] = $D, ...):
+            ...
+      - pattern-not: |
+          @$MCP.tool
+          def $F(..., $CRED: Annotated[$T | None, ...] = $D, ...):
+            ...
+      - pattern-not: |
+          @$MCP.tool
+          def $F(..., $CRED: Annotated[$T, ...] = None, ...):
+            ...
+      - pattern-not: |
+          @$MCP.tool
+          def $F(..., $CRED: Union[$T, None] = $D, ...):
+            ...
+      - pattern-not: |
+          @$MCP.tool
+          def $F(..., $CRED: Union[None, $T] = $D, ...):
+            ...
+      - pattern-not: |
+          @$MCP.tool
+          async def $F(..., $CRED: Optional[$T] = $D, ...):
+            ...
+      - pattern-not: |
+          @$MCP.tool
+          async def $F(..., $CRED: Optional[$T], ...):
+            ...
+      - pattern-not: |
+          @$MCP.tool
+          async def $F(..., $CRED: $T | None = $D, ...):
+            ...
+      - pattern-not: |
+          @$MCP.tool
+          async def $F(..., $CRED: $T | None, ...):
+            ...
+      - pattern-not: |
+          @$MCP.tool
+          async def $F(..., $CRED: $T = None, ...):
+            ...
+      - pattern-not: |
+          @$MCP.tool
+          async def $F(..., $CRED = None, ...):
+            ...
+      - pattern-not: |
+          @$MCP.tool
+          async def $F(..., $CRED: Annotated[Optional[$T], ...] = $D, ...):
+            ...
+      - pattern-not: |
+          @$MCP.tool
+          async def $F(..., $CRED: Annotated[$T | None, ...] = $D, ...):
+            ...
+      - pattern-not: |
+          @$MCP.tool
+          async def $F(..., $CRED: Annotated[$T, ...] = None, ...):
+            ...
+      - pattern-not: |
+          @$MCP.tool
+          async def $F(..., $CRED: Union[$T, None] = $D, ...):
+            ...
+      - pattern-not: |
+          @$MCP.tool
+          async def $F(..., $CRED: Union[None, $T] = $D, ...):
+            ...
+
+  # ----------------------------------------------------------------------------
+  # L3-03: MCP stdio server config passes secrets via CLI args (JSON & YAML)
+  # ----------------------------------------------------------------------------
+  - id: mcp-stdio-cli-secret-arg
+    message: >-
+      [L3-03 | Layer 3 | mcp] MCP server under "$SERVERS"
+      passes a credential flag (`--api-key`, `--token`, `--password`,
+      `--client-secret`) on the command line in `"args"`, exposing the secret in
+      process tables (`/proc/<pid>/cmdline`, `ps`). Pass credentials via a
+      minimal allowlisted `"env"` block backed by Secret Manager instead.
+    severity: ERROR
+    languages: [json]
+    metadata:
+      control_id: "L3-03"
+      rule_pack: "mcp"
+      layer: "Layer 3: Tool, Data Connector & Network Safety"
+      category: security
+      cwe: "CWE-214: Invocation of Process Using Visible Sensitive Information"
+      owasp_asi: "ASI03"
+      owasp_llm: "LLM02:2025 Sensitive Information Disclosure"
+      severity_tier: "HIGH"
+      title: "MCP Stdio Server Credential Flag Passed via CLI Args"
+      recommended_fix: "Remove --token / --api-key / --password flags from MCP server args and inject only the required secret via an explicit allowlisted env entry sourced from Secret Manager."
+    patterns:
+      - pattern-inside: |
+          "$SERVERS": $SERVER_MAP
+      - metavariable-regex:
+          metavariable: $SERVERS
+          regex: '^["'']?(?:mcpServers|servers|mcp_servers)["'']?$'
+      - pattern: |
+          {..., "command": $COMMAND, ..., "args": $ARGS, ...}
+      - metavariable-regex:
+          metavariable: $ARGS
+          regex: '(?is)^.*(?:^|["''\s\[,])--(?:api[-_]?key|access[-_]?token|refresh[-_]?token|bearer[-_]?token|auth[-_]?token|oauth[-_]?token|token|password|passwd|client[-_]?secret|secret[-_]?key)(?:=|[",''\s\]]|$)'
+
+  - id: mcp-stdio-cli-secret-arg-yaml
+    message: >-
+      [L3-03 | Layer 3 | mcp] MCP server under `$SERVERS`
+      passes a credential flag (`--api-key`, `--token`, `--password`,
+      `--client-secret`) on the command line in `args`, exposing the secret in
+      process tables (`/proc/<pid>/cmdline`, `ps`). Pass credentials via a
+      minimal allowlisted `env` block backed by Secret Manager instead.
+    severity: ERROR
+    languages: [yaml]
+    metadata:
+      control_id: "L3-03"
+      rule_pack: "mcp"
+      layer: "Layer 3: Tool, Data Connector & Network Safety"
+      category: security
+      cwe: "CWE-214: Invocation of Process Using Visible Sensitive Information"
+      owasp_asi: "ASI03"
+      owasp_llm: "LLM02:2025 Sensitive Information Disclosure"
+      severity_tier: "HIGH"
+      title: "MCP Stdio Server Credential Flag Passed via CLI Args (YAML)"
+      recommended_fix: "Remove --token / --api-key / --password flags from MCP server args and inject only the required secret via an explicit allowlisted env entry sourced from Secret Manager."
+    patterns:
+      - pattern-inside: |
+          $SERVERS: $SERVER_MAP
+      - metavariable-regex:
+          metavariable: $SERVERS
+          regex: '^["'']?(?:mcpServers|servers|mcp_servers|server_params|stdio_server_params)["'']?$'
+      - pattern: |
+          ...
+          command: $COMMAND
+          ...
+          args: $ARGS
+          ...
+      - metavariable-regex:
+          metavariable: $ARGS
+          regex: '(?is)^.*(?:^|["''\s\[,-])--(?:api[-_]?key|access[-_]?token|refresh[-_]?token|bearer[-_]?token|auth[-_]?token|oauth[-_]?token|token|password|passwd|client[-_]?secret|secret[-_]?key)(?:=|[",''\s\]]|$)'
+
+  # ----------------------------------------------------------------------------
+  # L3-01: Trusting MCP server-supplied readOnlyHint / destructiveHint for HITL
+  # ----------------------------------------------------------------------------
+  - id: mcp-untrusted-tool-annotations
+    message: >-
+      [L3-01 | Layer 3 | mcp] Authorization or human-in-the-loop
+      confirmation branches on MCP server-provided tool annotations
+      (`readOnlyHint` / `destructiveHint`). Because an external or compromised
+      MCP server controls its own annotations, it can mark a destructive tool
+      `readOnlyHint=True` to bypass confirmation. Key HITL and RBAC policy on an
+      operator-owned tool allowlist instead.
+    severity: ERROR
+    languages: [python]
+    paths:
+      exclude:
+        - "test_*.py"
+        - "*_test.py"
+        - "tests/**"
+    metadata:
+      control_id: "L3-01"
+      rule_pack: "mcp"
+      layer: "Layer 3: Tool, Data Connector & Network Safety"
+      category: security
+      cwe: "CWE-807: Reliance on Untrusted Inputs in a Security Decision"
+      owasp_asi: "ASI02"
+      owasp_llm: "LLM06:2025 Excessive Agency"
+      severity_tier: "HIGH"
+      title: "Reliance on Untrusted MCP Tool Annotations (readOnlyHint / destructiveHint)"
+      recommended_fix: "Never skip HITL confirmation or RBAC based on tool.annotations.readOnlyHint or destructiveHint; maintain an explicit operator-owned allowlist of verified read-only tool names and require confirmation for all other tools."
+    pattern-either:
+      - pattern: $OBJ.readOnlyHint
+      - pattern: $OBJ.read_only_hint
+      - pattern: $OBJ.destructiveHint
+      - pattern: $OBJ.destructive_hint
+      - pattern: $OBJ["readOnlyHint"]
+      - pattern: $OBJ["read_only_hint"]
+      - pattern: $OBJ["destructiveHint"]
+      - pattern: $OBJ["destructive_hint"]
+      - pattern: $OBJ.get("readOnlyHint", ...)
+      - pattern: $OBJ.get("readOnlyHint")
+      - pattern: $OBJ.get("read_only_hint", ...)
+      - pattern: $OBJ.get("read_only_hint")
+      - pattern: $OBJ.get("destructiveHint", ...)
+      - pattern: $OBJ.get("destructiveHint")
+      - pattern: $OBJ.get("destructive_hint", ...)
+      - pattern: $OBJ.get("destructive_hint")
+
+  # ----------------------------------------------------------------------------
+  # L3-03: MCP client config enables autoApprove / alwaysAllow or project auto-trust
+  # ----------------------------------------------------------------------------
+  - id: mcp-auto-approve-or-project-trust
+    message: >-
+      [L3-03 | Layer 3 | mcp] MCP client configuration sets
+      `enableAllProjectMcpServers: true` or configures `autoApprove` /
+      `alwaysAllow` on an MCP server, allowing untrusted repository configs or
+      rug-pulled MCP tools to execute without explicit human consent. Keep
+      `enableAllProjectMcpServers` disabled and require per-call confirmation on
+      state-mutating tools.
+    severity: ERROR
+    languages: [json]
+    metadata:
+      control_id: "L3-03"
+      rule_pack: "mcp"
+      layer: "Layer 3: Tool, Data Connector & Network Safety"
+      category: security
+      cwe: "CWE-862: Missing Authorization"
+      owasp_asi: "ASI04"
+      owasp_llm: "LLM06:2025 Excessive Agency"
+      severity_tier: "CRITICAL"
+      title: "MCP Auto-Approval or Automatic Project Server Execution Enabled"
+      recommended_fix: "Set enableAllProjectMcpServers to false and remove autoApprove / alwaysAllow lists (or keep them empty []) in MCP client configurations."
+    pattern-either:
+      - pattern: |
+          {..., "enableAllProjectMcpServers": true, ...}
+      - patterns:
+          - pattern-inside: |
+              "$SERVERS": $SERVER_MAP
+          - metavariable-regex:
+              metavariable: $SERVERS
+              regex: '^["'']?(?:mcpServers|servers|mcp_servers)["'']?$'
+          - pattern-either:
+              - pattern: |
+                  {..., "autoApprove": true, ...}
+              - pattern: |
+                  {..., "alwaysAllow": true, ...}
+              - pattern: |
+                  {..., "autoApprove": [$FIRST, ...], ...}
+              - pattern: |
+                  {..., "alwaysAllow": [$FIRST, ...], ...}
+
+  - id: mcp-auto-approve-or-project-trust-yaml
+    message: >-
+      [L3-03 | Layer 3 | mcp] MCP client configuration sets
+      `enableAllProjectMcpServers: true` or configures `autoApprove` /
+      `alwaysAllow` on an MCP server, allowing untrusted repository configs or
+      rug-pulled MCP tools to execute without explicit human consent. Keep
+      `enableAllProjectMcpServers` disabled and require per-call confirmation on
+      state-mutating tools.
+    severity: ERROR
+    languages: [yaml]
+    metadata:
+      control_id: "L3-03"
+      rule_pack: "mcp"
+      layer: "Layer 3: Tool, Data Connector & Network Safety"
+      category: security
+      cwe: "CWE-862: Missing Authorization"
+      owasp_asi: "ASI04"
+      owasp_llm: "LLM06:2025 Excessive Agency"
+      severity_tier: "CRITICAL"
+      title: "MCP Auto-Approval or Automatic Project Server Execution Enabled (YAML)"
+      recommended_fix: "Set enableAllProjectMcpServers: false and remove autoApprove / alwaysAllow entries (or set them to []) in MCP YAML configurations."
+    pattern-either:
+      - pattern: |
+          ...
+          enableAllProjectMcpServers: true
+          ...
+      - patterns:
+          - pattern-inside: |
+              $SERVERS: $SERVER_MAP
+          - metavariable-regex:
+              metavariable: $SERVERS
+              regex: '^["'']?(?:mcpServers|servers|mcp_servers)["'']?$'
+          - pattern-either:
+              - pattern: |
+                  ...
+                  autoApprove: true
+                  ...
+              - pattern: |
+                  ...
+                  alwaysAllow: true
+                  ...
+              - patterns:
+                  - pattern-either:
+                      - pattern: |
+                          ...
+                          autoApprove: $LIST
+                          ...
+                      - pattern: |
+                          ...
+                          alwaysAllow: $LIST
+                          ...
+                  - metavariable-regex:
+                      metavariable: $LIST
+                      regex: '(?s)^(?!\s*\[\s*\]?\s*$)(?!\s*(?:false|False|null|~)\s*$)\S+'
+
+  # ----------------------------------------------------------------------------
+  # L3-03: External HTTP(S) $ref in OpenAPI or MCP tool JSON/YAML schemas
+  # ----------------------------------------------------------------------------
+  - id: mcp-remote-schema-ref
+    message: >-
+      [L3-03 | Layer 3 | mcp] Tool or OpenAPI schema contains
+      an external HTTP(S) `"$ref": "$URI"`, exposing schema validation to
+      Server-Side Request Forgery (SSRF) and remote schema rug-pulls. Inline
+      referenced definitions under local `#/components/schemas/...` or `#/$defs/...`.
+    severity: WARNING
+    languages: [json]
+    metadata:
+      control_id: "L3-03"
+      rule_pack: "mcp"
+      layer: "Layer 3: Tool, Data Connector & Network Safety"
+      category: security
+      cwe: "CWE-918: Server-Side Request Forgery (SSRF)"
+      owasp_asi: "ASI02"
+      owasp_llm: "LLM03:2025 Supply Chain"
+      severity_tier: "MEDIUM"
+      title: "External HTTP(S) $ref in Tool or OpenAPI Schema"
+      recommended_fix: "Vendor external schema definitions locally and reference them with document-local JSON Pointers such as \"#/components/schemas/...\" or \"#/$defs/...\"."
+    patterns:
+      - pattern-either:
+          - pattern-inside: |
+              {..., "openapi": $VER, ...}
+          - pattern-inside: |
+              {..., "swagger": $VER, ...}
+          - pattern-inside: |
+              "inputSchema": $SCHEMA
+          - pattern-inside: |
+              "outputSchema": $SCHEMA
+          - pattern-inside: |
+              "input_schema": $SCHEMA
+          - pattern-inside: |
+              "output_schema": $SCHEMA
+          - pattern-inside: |
+              "parameters": $SCHEMA
+      - pattern: |
+          {..., "$ref": "$URI", ...}
+      - metavariable-regex:
+          metavariable: $URI
+          regex: '^https?://'
+
+  - id: mcp-remote-schema-ref-yaml
+    message: >-
+      [L3-03 | Layer 3 | mcp] Tool or OpenAPI YAML schema
+      contains an external HTTP(S) `$ref` (`$URI`), exposing schema validation
+      to Server-Side Request Forgery (SSRF) and remote schema rug-pulls. Inline
+      referenced definitions under local `#/components/schemas/...` or `#/$defs/...`.
+    severity: WARNING
+    languages: [yaml]
+    metadata:
+      control_id: "L3-03"
+      rule_pack: "mcp"
+      layer: "Layer 3: Tool, Data Connector & Network Safety"
+      category: security
+      cwe: "CWE-918: Server-Side Request Forgery (SSRF)"
+      owasp_asi: "ASI02"
+      owasp_llm: "LLM03:2025 Supply Chain"
+      severity_tier: "MEDIUM"
+      title: "External HTTP(S) $ref in Tool or OpenAPI Schema (YAML)"
+      recommended_fix: "Vendor external schema definitions locally and reference them with document-local JSON Pointers such as '#/components/schemas/...' or '#/$defs/...'."
+    patterns:
+      - pattern-either:
+          - pattern-inside: |
+              ...
+              openapi: $VER
+              ...
+          - pattern-inside: |
+              ...
+              swagger: $VER
+              ...
+          - pattern-inside: |
+              inputSchema: $SCHEMA
+          - pattern-inside: |
+              outputSchema: $SCHEMA
+          - pattern-inside: |
+              input_schema: $SCHEMA
+          - pattern-inside: |
+              output_schema: $SCHEMA
+          - pattern-inside: |
+              parameters: $SCHEMA
+      - pattern: |
+          ...
+          $REF_KEY: $URI
+          ...
+      - metavariable-regex:
+          metavariable: $REF_KEY
+          regex: '^["'']?\$ref["'']?$'
+      - metavariable-regex:
+          metavariable: $URI
+          regex: '^["'']?https?://'
+
+  # ----------------------------------------------------------------------------
+  # L3-03: MCP sampling/createMessage requests context across all connected servers
+  # ----------------------------------------------------------------------------
+  - id: mcp-sampling-context-oversharing
+    message: >-
+      [L3-03 | Layer 3 | mcp] MCP sampling request sets
+      `includeContext="allServers"`, allowing a single MCP server to pull prompt
+      context from every other MCP server connected to the host (cross-server
+      data exfiltration). Set `includeContext="none"` and pass only explicitly
+      scoped messages.
+    severity: WARNING
+    languages: [python]
+    metadata:
+      control_id: "L3-03"
+      rule_pack: "mcp"
+      layer: "Layer 3: Tool, Data Connector & Network Safety"
+      category: security
+      cwe: "CWE-200: Exposure of Sensitive Information to an Unauthorized Actor"
+      owasp_asi: "ASI06"
+      owasp_llm: "LLM02:2025 Sensitive Information Disclosure"
+      severity_tier: "HIGH"
+      title: "MCP Sampling Context Over-Sharing (includeContext='allServers')"
+      recommended_fix: "Set includeContext='none' (or omit includeContext) on MCP sampling/createMessage requests and pass only explicitly sanitized message content."
+    pattern-either:
+      - pattern: $CALL(..., includeContext="allServers", ...)
+      - pattern: $CALL(..., include_context="allServers", ...)
+      - pattern: |
+          {..., "includeContext": "allServers", ...}
+      - pattern: |
+          {..., "include_context": "allServers", ...}
+
+  # ----------------------------------------------------------------------------
+  # L5-02: JSON-RPC 2.0 request explicitly sets null/None request correlation id
+  # ----------------------------------------------------------------------------
+  - id: mcp-jsonrpc-null-id
+    message: >-
+      [L5-02 | Layer 5 | mcp] JSON-RPC 2.0 request payload sets
+      `"id": None`, breaking per-request audit correlation and enabling
+      untracked or spoofed responses. Generate a unique non-null request `id`
+      for every RPC call (or omit `"id"` entirely for true one-way notifications).
+    severity: WARNING
+    languages: [python]
+    metadata:
+      control_id: "L5-02"
+      rule_pack: "mcp"
+      layer: "Layer 5: Resilience, Telemetry & Secure Delivery Gates"
+      category: security
+      cwe: "CWE-778: Insufficient Logging"
+      owasp_asi: "ASI10"
+      owasp_llm: "LLM06:2025 Excessive Agency"
+      severity_tier: "MEDIUM"
+      title: "Null JSON-RPC 2.0 Request Correlation ID"
+      recommended_fix: "Assign a unique string or integer request id (e.g. str(uuid.uuid4())) on JSON-RPC 2.0 requests; omit the 'id' field only on true notifications."
+    pattern: |
+      {..., "jsonrpc": "2.0", ..., "method": $METHOD, ..., "id": None, ...}
+
+  - id: mcp-jsonrpc-null-id-json
+    message: >-
+      [L5-02 | Layer 5 | mcp] JSON-RPC 2.0 request payload sets
+      `"id": null`, breaking per-request audit correlation and enabling
+      untracked or spoofed responses. Generate a unique non-null request `id`
+      for every RPC call (or omit `"id"` entirely for true one-way notifications).
+    severity: WARNING
+    languages: [json]
+    metadata:
+      control_id: "L5-02"
+      rule_pack: "mcp"
+      layer: "Layer 5: Resilience, Telemetry & Secure Delivery Gates"
+      category: security
+      cwe: "CWE-778: Insufficient Logging"
+      owasp_asi: "ASI10"
+      owasp_llm: "LLM06:2025 Excessive Agency"
+      severity_tier: "MEDIUM"
+      title: "Null JSON-RPC 2.0 Request Correlation ID (JSON)"
+      recommended_fix: "Assign a unique string or integer request id on JSON-RPC 2.0 requests; omit the 'id' field only on true notifications."
+    pattern: |
+      {..., "jsonrpc": "2.0", ..., "method": $METHOD, ..., "id": null, ...}
